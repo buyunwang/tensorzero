@@ -9,7 +9,7 @@ use crate::{
     uuid_util::validate_episode_id,
 };
 
-use super::{ContentBlock, Input, ModelInferenceRequest, RequestMessage, Usage};
+use super::{ContentBlockOutput, ModelInferenceRequest, RequestMessage, ResolvedInput, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
@@ -165,16 +165,21 @@ where
     serde_json::from_str(&json_str).map_err(serde::de::Error::custom)
 }
 
-fn deserialize_optional_json_string<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub fn deserialize_optional_json_string<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
     let opt_json_str: Option<String> = Option::deserialize(deserializer)?;
     match opt_json_str {
-        Some(json_str) => serde_json::from_str(&json_str)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
+        Some(json_str) => {
+            if json_str.is_empty() {
+                return Ok(None);
+            }
+            serde_json::from_str(&json_str)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
         None => Ok(None),
     }
 }
@@ -182,7 +187,7 @@ where
 #[derive(Debug)]
 pub struct ProviderBatchInferenceOutput {
     pub id: Uuid,
-    pub output: Vec<ContentBlock>,
+    pub output: Vec<ContentBlockOutput>,
     pub raw_response: String,
     pub usage: Usage,
 }
@@ -218,10 +223,11 @@ pub struct BatchModelInferenceRow<'a> {
     pub variant_name: Cow<'a, str>,
     pub episode_id: Uuid,
     #[serde(deserialize_with = "deserialize_json_string")]
-    pub input: Input,
+    pub input: ResolvedInput,
     #[serde(deserialize_with = "deserialize_json_string")]
     pub input_messages: Vec<RequestMessage>,
     pub system: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "deserialize_optional_json_string")]
     pub tool_params: Option<ToolCallConfigDatabaseInsert>,
     #[serde(deserialize_with = "deserialize_json_string")]

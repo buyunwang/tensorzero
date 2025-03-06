@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -11,21 +12,27 @@ use tokio::time::Instant;
 use url::Url;
 use uuid::Uuid;
 
+use crate::cache::ModelProviderRequest;
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::providers::provider_trait::InferenceProvider;
 use crate::inference::types::batch::{BatchRequestRow, PollBatchInferenceResponse};
+use crate::inference::types::resolved_input::ImageWithPath;
+use crate::inference::types::FlattenUnknown;
 use crate::inference::types::{
     batch::StartBatchProviderInferenceResponse, serialize_or_log, ModelInferenceRequest,
     PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
     ProviderInferenceResponseChunk, RequestMessage, Usage,
 };
 use crate::inference::types::{
-    ContentBlock, ContentBlockChunk, Latency, ModelInferenceRequestJsonMode,
+    ContentBlock, ContentBlockChunk, ContentBlockOutput, Latency, ModelInferenceRequestJsonMode,
     ProviderInferenceResponseStreamInner, Role, Text, TextChunk,
 };
-use crate::model::{build_creds_caching_default, Credential, CredentialLocation};
+use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
 use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
+
+use super::gcp_vertex_gemini::process_output_schema;
+use super::helpers::inject_extra_body;
 
 const PROVIDER_NAME: &str = "Google AI Studio Gemini";
 const PROVIDER_TYPE: &str = "google_ai_studio_gemini";
@@ -132,11 +139,21 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
     /// Google AI Studio Gemini non-streaming API request
     async fn infer<'a>(
         &'a self,
-        request: &'a ModelInferenceRequest<'_>,
+        ModelProviderRequest {
+            request,
+            provider_name: _,
+            model_name: _,
+        }: ModelProviderRequest<'a>,
         http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body: GeminiRequest = GeminiRequest::new(request)?;
+        let mut request_body = serde_json::to_value(GeminiRequest::new(request)?).map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!("Error serializing Gemini request: {e}"),
+            })
+        })?;
+        inject_extra_body(request.extra_body, model_provider, &mut request_body)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
         let mut url = self.request_url.clone();
@@ -205,8 +222,14 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
         request: &'a ModelInferenceRequest<'_>,
         http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body: GeminiRequest = GeminiRequest::new(request)?;
+        let mut request_body = serde_json::to_value(GeminiRequest::new(request)?).map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!("Error serializing Gemini request: {e}"),
+            })
+        })?;
+        inject_extra_body(request.extra_body, model_provider, &mut request_body)?;
         let raw_request = serde_json::to_string(&request_body).map_err(|e| {
             Error::new(ErrorDetails::Serialization {
                 message: format!("Error serializing request: {e}"),
@@ -341,7 +364,10 @@ enum GeminiPart<'a> {
     Text {
         text: &'a str,
     },
-    // TODO (if needed): InlineData { inline_data: Blob },
+    InlineData {
+        #[serde(rename = "inline_data")]
+        inline_data: GeminiInlineData<'a>,
+    },
     // TODO (if needed): FileData { file_data: FileData },
     FunctionCall {
         function_call: GeminiFunctionCall<'a>,
@@ -353,12 +379,20 @@ enum GeminiPart<'a> {
     // TODO (if needed): ExecutableCodeResult [docs](https://ai.google.dev/api/caching#CodeExecutionResult)
 }
 
-impl<'a> TryFrom<&'a ContentBlock> for GeminiPart<'a> {
+#[derive(Debug, PartialEq, Serialize)]
+struct GeminiInlineData<'a> {
+    mime_type: String,
+    data: &'a str,
+}
+
+impl<'a> TryFrom<&'a ContentBlock> for Option<FlattenUnknown<'a, GeminiPart<'a>>> {
     type Error = Error;
 
     fn try_from(block: &'a ContentBlock) -> Result<Self, Error> {
         match block {
-            ContentBlock::Text(Text { text }) => Ok(GeminiPart::Text { text }),
+            ContentBlock::Text(Text { text }) => {
+                Ok(Some(FlattenUnknown::Normal(GeminiPart::Text { text })))
+            }
             ContentBlock::ToolResult(tool_result) => {
                 // Convert the tool result from String to JSON Value (Gemini expects an object)
                 let response: Value = serde_json::from_str(&tool_result.result).map_err(|e| {
@@ -377,12 +411,12 @@ impl<'a> TryFrom<&'a ContentBlock> for GeminiPart<'a> {
                     "content": response,
                 });
 
-                Ok(GeminiPart::FunctionResponse {
+                Ok(Some(FlattenUnknown::Normal(GeminiPart::FunctionResponse {
                     function_response: GeminiFunctionResponse {
                         name: &tool_result.name,
                         response,
                     },
-                })
+                })))
             }
             ContentBlock::ToolCall(tool_call) => {
                 // Convert the tool call arguments from String to JSON Value (Gemini expects an object)
@@ -407,13 +441,33 @@ impl<'a> TryFrom<&'a ContentBlock> for GeminiPart<'a> {
                     .into());
                 }
 
-                Ok(GeminiPart::FunctionCall {
+                Ok(Some(FlattenUnknown::Normal(GeminiPart::FunctionCall {
                     function_call: GeminiFunctionCall {
                         name: &tool_call.name,
                         args,
                     },
-                })
+                })))
             }
+            ContentBlock::Image(ImageWithPath {
+                image,
+                storage_path: _,
+            }) => Ok(Some(FlattenUnknown::Normal(GeminiPart::InlineData {
+                inline_data: GeminiInlineData {
+                    mime_type: image.mime_type.to_string(),
+                    data: image.data()?.as_str(),
+                },
+            }))),
+
+            // We don't support thought blocks being passed in from a request.
+            // These are only possible to be passed in in the scenario where the
+            // output of a chat completion is used as an input to another model inference,
+            // i.e. a judge or something.
+            // We don't think the thoughts should be passed in in this case.
+            ContentBlock::Thought(_thought) => Ok(None),
+            ContentBlock::Unknown {
+                data,
+                model_provider_name: _,
+            } => Ok(Some(FlattenUnknown::Unknown(Cow::Borrowed(data)))),
         }
     }
 }
@@ -421,7 +475,7 @@ impl<'a> TryFrom<&'a ContentBlock> for GeminiPart<'a> {
 #[derive(Debug, PartialEq, Serialize)]
 struct GeminiContent<'a> {
     role: GeminiRole,
-    parts: Vec<GeminiPart<'a>>,
+    parts: Vec<FlattenUnknown<'a, GeminiPart<'a>>>,
 }
 
 impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
@@ -429,11 +483,14 @@ impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
 
     fn try_from(message: &'a RequestMessage) -> Result<Self, Self::Error> {
         let role = GeminiRole::from(message.role);
-        let parts: Vec<GeminiPart> = message
+        let parts: Vec<FlattenUnknown<GeminiPart>> = message
             .content
             .iter()
             .map(|block| block.try_into())
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<Option<FlattenUnknown<GeminiPart>>>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         Ok(GeminiContent { role, parts })
     }
@@ -617,7 +674,7 @@ impl<'a> GeminiRequest<'a> {
             generation_config,
             system_instruction: system_instruction.map(|content| GeminiContent {
                 role: GeminiRole::Model,
-                parts: vec![content],
+                parts: vec![FlattenUnknown::Normal(content)],
             }),
         })
     }
@@ -640,31 +697,6 @@ fn prepare_tools<'a>(
         }
         None => (None, None),
     }
-}
-
-fn process_output_schema(output_schema: &Value) -> Result<Value, Error> {
-    let mut schema = output_schema.clone();
-
-    /// Recursively remove all instances of "additionalProperties"
-    fn remove_additional_properties(value: &mut Value) {
-        match value {
-            Value::Object(obj) => {
-                obj.remove("additionalProperties");
-                for (_, v) in obj.iter_mut() {
-                    remove_additional_properties(v);
-                }
-            }
-            Value::Array(arr) => {
-                for v in arr.iter_mut() {
-                    remove_additional_properties(v);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    remove_additional_properties(&mut schema);
-    Ok(schema)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -706,13 +738,13 @@ impl From<GeminiResponseContentPart> for ContentBlockChunk {
     }
 }
 
-impl TryFrom<GeminiResponseContentPart> for ContentBlock {
+impl TryFrom<GeminiResponseContentPart> for ContentBlockOutput {
     type Error = Error;
     fn try_from(part: GeminiResponseContentPart) -> Result<Self, Self::Error> {
         match part {
             GeminiResponseContentPart::Text(text) => Ok(text.into()),
             GeminiResponseContentPart::FunctionCall(function_call) => {
-                Ok(ContentBlock::ToolCall(ToolCall {
+                Ok(ContentBlockOutput::ToolCall(ToolCall {
                     name: function_call.name,
                     arguments: serde_json::to_string(&function_call.args).map_err(|e| {
                         Error::new(ErrorDetails::Serialization {
@@ -770,7 +802,7 @@ struct GeminiResponseWithMetadata<'a> {
     response: GeminiResponse,
     raw_response: String,
     latency: Latency,
-    request: GeminiRequest<'a>,
+    request: serde_json::Value,
     generic_request: &'a ModelInferenceRequest<'a>,
 }
 
@@ -797,12 +829,12 @@ impl<'a> TryFrom<GeminiResponseWithMetadata<'a>> for ProviderInferenceResponse {
         })?;
 
         // Gemini sometimes doesn't return content in the response (e.g. safety settings blocked the generation).
-        let content: Vec<ContentBlock> = match first_candidate.content {
+        let content: Vec<ContentBlockOutput> = match first_candidate.content {
             Some(content) => content
                 .parts
                 .into_iter()
                 .map(|part| part.try_into())
-                .collect::<Result<Vec<ContentBlock>, Error>>()?,
+                .collect::<Result<Vec<ContentBlockOutput>, Error>>()?,
             None => vec![],
         };
 
@@ -922,7 +954,7 @@ mod tests {
 
     use super::*;
     use crate::inference::providers::common::{MULTI_TOOL_CONFIG, QUERY_TOOL, WEATHER_TOOL};
-    use crate::inference::types::{FunctionType, ModelInferenceRequestJsonMode};
+    use crate::inference::types::{FlattenUnknown, FunctionType, ModelInferenceRequestJsonMode};
     use crate::tool::{ToolCallConfig, ToolResult};
 
     #[test]
@@ -936,9 +968,9 @@ mod tests {
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
             content.parts[0],
-            GeminiPart::Text {
+            FlattenUnknown::Normal(GeminiPart::Text {
                 text: "Hello, world!"
-            }
+            })
         );
 
         let message = RequestMessage {
@@ -950,9 +982,9 @@ mod tests {
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
             content.parts[0],
-            GeminiPart::Text {
+            FlattenUnknown::Normal(GeminiPart::Text {
                 text: "Hello, world!"
-            }
+            })
         );
         let message = RequestMessage {
             role: Role::Assistant,
@@ -970,18 +1002,18 @@ mod tests {
         assert_eq!(content.parts.len(), 2);
         assert_eq!(
             content.parts[0],
-            GeminiPart::Text {
+            FlattenUnknown::Normal(GeminiPart::Text {
                 text: "Here's the result of the function call:"
-            }
+            })
         );
         assert_eq!(
             content.parts[1],
-            GeminiPart::FunctionCall {
+            FlattenUnknown::Normal(GeminiPart::FunctionCall {
                 function_call: GeminiFunctionCall {
                     name: "get_temperature",
                     args: json!({"location": "New York", "unit": "celsius"}),
                 }
-            }
+            })
         );
 
         let message = RequestMessage {
@@ -997,7 +1029,7 @@ mod tests {
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
             content.parts[0],
-            GeminiPart::FunctionResponse {
+            FlattenUnknown::Normal(GeminiPart::FunctionResponse {
                 function_response: GeminiFunctionResponse {
                     name: "get_temperature",
                     response: json!({
@@ -1005,7 +1037,7 @@ mod tests {
                         "content": json!({"temperature": 25, "conditions": "sunny"})
                     }),
                 }
-            }
+            })
         );
     }
 
@@ -1105,6 +1137,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let result = GeminiRequest::new(&inference_request);
         let details = result.unwrap_err().get_owned_details();
@@ -1141,6 +1174,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let result = GeminiRequest::new(&inference_request);
         let request = result.unwrap();
@@ -1148,15 +1182,15 @@ mod tests {
         assert_eq!(request.contents[0].role, GeminiRole::User);
         assert_eq!(
             request.contents[0].parts[0],
-            GeminiPart::Text { text: "test_user" }
+            FlattenUnknown::Normal(GeminiPart::Text { text: "test_user" })
         );
         assert_eq!(request.contents[1].role, GeminiRole::Model);
         assert_eq!(request.contents[1].parts.len(), 1);
         assert_eq!(
             request.contents[1].parts[0],
-            GeminiPart::Text {
+            FlattenUnknown::Normal(GeminiPart::Text {
                 text: "test_assistant"
-            }
+            })
         );
 
         // Test case 3: Messages with system message and some of the optional fields are tested
@@ -1190,6 +1224,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::On,
             function_type: FunctionType::Chat,
             output_schema: Some(&output_schema),
+            extra_body: None,
         };
         // JSON schema should be supported for Gemini Pro models
         let result = GeminiRequest::new(&inference_request);
@@ -1203,17 +1238,17 @@ mod tests {
         assert_eq!(request.contents[2].parts.len(), 1);
         assert_eq!(
             request.contents[0].parts[0],
-            GeminiPart::Text { text: "test_user" }
+            FlattenUnknown::Normal(GeminiPart::Text { text: "test_user" })
         );
         assert_eq!(
             request.contents[1].parts[0],
-            GeminiPart::Text { text: "test_user2" }
+            FlattenUnknown::Normal(GeminiPart::Text { text: "test_user2" })
         );
         assert_eq!(
             request.contents[2].parts[0],
-            GeminiPart::Text {
+            FlattenUnknown::Normal(GeminiPart::Text {
                 text: "test_assistant"
-            }
+            })
         );
         assert_eq!(
             request.generation_config.as_ref().unwrap().temperature,
@@ -1290,6 +1325,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let request_body = GeminiRequest {
             contents: vec![],
@@ -1303,7 +1339,7 @@ mod tests {
         let response_with_latency = GeminiResponseWithMetadata {
             response,
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             generic_request: &generic_request,
             raw_response: raw_response.clone(),
         };
@@ -1372,6 +1408,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let request_body = GeminiRequest {
             contents: vec![],
@@ -1384,14 +1421,14 @@ mod tests {
         let response_with_latency = GeminiResponseWithMetadata {
             response,
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             generic_request: &generic_request,
             raw_response: raw_response.clone(),
         };
         let model_inference_response: ProviderInferenceResponse =
             response_with_latency.try_into().unwrap();
 
-        if let [ContentBlock::Text(Text { text }), ContentBlock::ToolCall(tool_call)] =
+        if let [ContentBlockOutput::Text(Text { text }), ContentBlockOutput::ToolCall(tool_call)] =
             &model_inference_response.output[..]
         {
             assert_eq!(text, "Here's the weather information:");
@@ -1471,15 +1508,16 @@ mod tests {
         let response_with_latency = GeminiResponseWithMetadata {
             response,
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             generic_request: &generic_request,
             raw_response: raw_response.clone(),
         };
         let model_inference_response: ProviderInferenceResponse =
             response_with_latency.try_into().unwrap();
         assert_eq!(model_inference_response.raw_request, raw_request);
+
         assert_eq!(model_inference_response.raw_response, raw_response);
-        if let [ContentBlock::Text(Text { text: text1 }), ContentBlock::ToolCall(tool_call1), ContentBlock::Text(Text { text: text2 }), ContentBlock::ToolCall(tool_call2)] =
+        if let [ContentBlockOutput::Text(Text { text: text1 }), ContentBlockOutput::ToolCall(tool_call1), ContentBlockOutput::Text(Text { text: text2 }), ContentBlockOutput::ToolCall(tool_call2)] =
             &model_inference_response.output[..]
         {
             assert_eq!(text1, "Here's the weather information:");
@@ -1542,6 +1580,7 @@ mod tests {
             tool_config: Some(Cow::Borrowed(&MULTI_TOOL_CONFIG)),
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let (tools, tool_choice) = prepare_tools(&request_with_tools);
         let tools = tools.unwrap();
@@ -1583,6 +1622,7 @@ mod tests {
             tool_config: Some(Cow::Borrowed(&MULTI_TOOL_CONFIG)),
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let (tools, tool_choice) = prepare_tools(&request_with_tools);
         let tools = tools.unwrap();

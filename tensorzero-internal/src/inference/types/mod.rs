@@ -1,20 +1,28 @@
+use crate::inference::types::batch::deserialize_json_string;
+use crate::inference::types::batch::deserialize_optional_json_string;
 use derive_builder::Builder;
 use futures::stream::Peekable;
 use futures::Stream;
+use image::sanitize_raw_request;
+pub use image::{Base64Image, Image, ImageKind};
+use resolved_input::ImageWithPath;
+pub use resolved_input::{ResolvedInput, ResolvedInputMessage, ResolvedInputMessageContent};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use serde_untagged::UntaggedEnumVisitor;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fmt,
+    fmt::{self},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-use crate::cache::CacheData;
 use crate::cache::NonStreamingCacheData;
+use crate::variant::chat_completion::ExtraBodyConfig;
+use crate::{cache::CacheData, config_parser::ObjectStoreInfo};
 use crate::{endpoints::inference::InferenceParams, error::ErrorDetails};
 use crate::{
     endpoints::inference::{InferenceDatabaseInsertMetadata, InferenceIds},
@@ -29,6 +37,9 @@ use crate::{
 use crate::{jsonschema_util::DynamicJSONSchema, tool::ToolCallConfigDatabaseInsert};
 
 pub mod batch;
+pub mod image;
+pub mod resolved_input;
+pub mod storage;
 
 /*
  * Data flow in TensorZero
@@ -47,23 +58,141 @@ pub struct Input {
     pub messages: Vec<InputMessage>,
 }
 
+pub struct FetchContext<'a> {
+    pub client: &'a reqwest::Client,
+    pub object_store_info: &'a Option<ObjectStoreInfo>,
+}
+
+impl Input {
+    /// Resolves any nested network resources in the input.
+    /// Currently, this resolves input image urls into base64-encoded images.
+    pub async fn resolve(self, context: &FetchContext<'_>) -> Result<ResolvedInput, Error> {
+        let messages = futures::future::try_join_all(
+            self.messages
+                .into_iter()
+                .map(|message| message.resolve(context)),
+        )
+        .await?;
+        Ok(ResolvedInput {
+            system: self.system,
+            messages,
+        })
+    }
+}
+
+impl InputMessage {
+    pub async fn resolve(self, context: &FetchContext<'_>) -> Result<ResolvedInputMessage, Error> {
+        let content = futures::future::try_join_all(
+            self.content
+                .into_iter()
+                .map(|content| content.resolve(context)),
+        )
+        .await?;
+        Ok(ResolvedInputMessage {
+            role: self.role,
+            content,
+        })
+    }
+}
+
+impl InputMessageContent {
+    pub async fn resolve(
+        self,
+        context: &FetchContext<'_>,
+    ) -> Result<ResolvedInputMessageContent, Error> {
+        Ok(match self {
+            InputMessageContent::Text(TextKind::Text { text }) => {
+                ResolvedInputMessageContent::Text {
+                    value: Value::String(text),
+                }
+            }
+            InputMessageContent::Text(TextKind::Arguments { arguments }) => {
+                ResolvedInputMessageContent::Text {
+                    value: Value::Object(arguments),
+                }
+            }
+            InputMessageContent::ToolCall(tool_call) => {
+                ResolvedInputMessageContent::ToolCall(tool_call)
+            }
+            InputMessageContent::ToolResult(tool_result) => {
+                ResolvedInputMessageContent::ToolResult(tool_result)
+            }
+            InputMessageContent::RawText { value } => {
+                ResolvedInputMessageContent::RawText { value }
+            }
+            InputMessageContent::Text(TextKind::LegacyValue { value }) => {
+                tracing::warn!(
+                    r#"Deprecation warning: `{{"type": "text", "value", ...}}` is deprecated. Please use `{{"type": "text", "text": "String input"}}` or `{{"type": "text", "arguments": {{..}}}} ` instead."#
+                );
+                ResolvedInputMessageContent::Text { value }
+            }
+            InputMessageContent::Image(image) => {
+                let storage_kind = context
+                    .object_store_info
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::new(ErrorDetails::ObjectStoreUnconfigured {
+                            block_type: "image".to_string(),
+                        })
+                    })?
+                    .kind
+                    .clone();
+                let image = image.take_or_fetch(context.client).await?;
+                let path = storage_kind.image_path(&image)?;
+                ResolvedInputMessageContent::Image(ImageWithPath {
+                    image,
+                    storage_path: path,
+                })
+            }
+            InputMessageContent::Unknown {
+                data,
+                model_provider_name,
+            } => ResolvedInputMessageContent::Unknown {
+                data,
+                model_provider_name,
+            },
+        })
+    }
+}
+
 /// InputMessage and Role are our representation of the input sent by the client
 /// prior to any processing into LLM representations below.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct InputMessage {
     pub role: Role,
+    #[serde(deserialize_with = "deserialize_content")]
     pub content: Vec<InputMessageContent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputMessageContent {
-    Text { value: Value },
+    Text(TextKind),
     ToolCall(ToolCall),
     ToolResult(ToolResult),
-    RawText { value: String },
+    RawText {
+        value: String,
+    },
+    Image(Image),
+    /// An unknown content block type, used to allow passing provider-specific
+    /// content blocks (e.g. Anthropic's "redacted_thinking") in and out
+    /// of TensorZero.
+    /// The 'data' field hold the original content block from the provider,
+    /// without any validation or transformation by TensorZero.
+    Unknown {
+        data: Value,
+        model_provider_name: Option<String>,
+    },
     // We may extend this in the future to include other types of content
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum TextKind {
+    Text { text: String },
+    Arguments { arguments: Map<String, Value> },
+    LegacyValue { value: Value },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -87,20 +216,80 @@ pub struct Text {
     pub text: String,
 }
 
-/// Core representation of the types of content that could go in or out of a model
+/// Struct that represents Chain of Thought reasoning
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Thought {
+    pub text: String,
+}
+
+/// Core representation of the types of content that could go into a model provider
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text(Text),
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    Image(ImageWithPath),
+    Thought(Thought),
+    /// Represents an unknown provider-specific content block.
+    /// We pass this along as-is without any validation or transformation.
+    Unknown {
+        /// The underlying content block to be passed to the model provider.
+        data: Value,
+        /// A fully-qualified name specifying when this content block should
+        /// be included in the model provider input.
+        /// E.g `tensorzero::model_name::claude-3-7-sonnet-20250219-thinking::provider_name::anthropic-extra-body`
+        ///
+        /// If set to `Some`, this is compared against the output of `fully_qualified_name` before invoking
+        /// a model provider, and stripped from the input if it doesn't match.
+        /// If set to `None, then this is passed to all model providers.
+        /// Individual model provider implementation never need to check this field themselves -
+        /// they only need to produce it with the proper `fully_qualified_name` set.
+        model_provider_name: Option<String>,
+    },
 }
 
+/// A helper type for dealing with `ContentBlock::Unknown` in model providers.
+/// This flattens the wrapped `Value` when serializing and deserializing.
+///
+/// During deserialization, we'll first attempt to deserialize a `T`
+/// (e.g. `AnthropicContentBlock`), and fall back to `Unknown` with the raw
+/// json `Value` if that fails.
+///
+/// During serialization, a `FlattenUnknown::Unknown` will have the wrapped
+/// `Value` serialized, allowing us to send an arbitrary json value to
+/// a provider.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum FlattenUnknown<'a, T> {
+    Normal(T),
+    Unknown(Cow<'a, Value>),
+}
+
+/// Defines the types of content block that can come out of a model provider
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockOutput {
     Text(Text),
+    ToolCall(ToolCall),
+    Thought(Thought),
+    Unknown {
+        data: Value,
+        model_provider_name: Option<String>,
+    },
+}
+
+/// Defines the types of content block that can come from a `chat` function
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlockChatOutput {
+    Text(Text),
     ToolCall(ToolCallOutput),
+    Thought(Thought),
+    Unknown {
+        data: Value,
+        model_provider_name: Option<String>,
+    },
 }
 
 /// A RequestMessage is a message sent to a model
@@ -149,6 +338,7 @@ pub struct ModelInferenceRequest<'a> {
     pub json_mode: ModelInferenceRequestJsonMode,
     pub function_type: FunctionType,
     pub output_schema: Option<&'a Value>,
+    pub extra_body: Option<&'a ExtraBodyConfig>,
 }
 
 /// Each provider transforms a ModelInferenceRequest into a provider-specific (private) inference request type
@@ -162,7 +352,7 @@ pub struct ModelInferenceRequest<'a> {
 pub struct ProviderInferenceResponse {
     pub id: Uuid,
     pub created: u64,
-    pub output: Vec<ContentBlock>,
+    pub output: Vec<ContentBlockOutput>,
     pub system: Option<String>,
     pub input_messages: Vec<RequestMessage>,
     pub raw_request: String,
@@ -196,7 +386,7 @@ pub enum Latency {
 pub struct ModelInferenceResponse {
     pub id: Uuid,
     pub created: u64,
-    pub output: Vec<ContentBlock>,
+    pub output: Vec<ContentBlockOutput>,
     pub system: Option<String>,
     pub input_messages: Vec<RequestMessage>,
     pub raw_request: String,
@@ -213,7 +403,7 @@ pub struct ModelInferenceResponse {
 pub struct ModelInferenceResponseWithMetadata {
     pub id: Uuid,
     pub created: u64,
-    pub output: Vec<ContentBlock>,
+    pub output: Vec<ContentBlockOutput>,
     pub system: Option<String>,
     pub input_messages: Vec<RequestMessage>,
     pub raw_request: String,
@@ -243,7 +433,7 @@ pub enum InferenceResult {
 pub struct ChatInferenceResult {
     pub inference_id: Uuid,
     created: u64,
-    pub content: Vec<ContentBlockOutput>,
+    pub content: Vec<ContentBlockChatOutput>,
     pub usage: Usage,
     pub model_inference_results: Vec<ModelInferenceResponseWithMetadata>,
     pub inference_params: InferenceParams,
@@ -284,10 +474,17 @@ pub struct ProviderInferenceResponseChunk {
 pub enum ContentBlockChunk {
     Text(TextChunk),
     ToolCall(ToolCallChunk),
+    Thought(ThoughtChunk),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextChunk {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThoughtChunk {
     pub id: String,
     pub text: String,
 }
@@ -304,7 +501,8 @@ pub struct ChatInferenceResultChunk {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct JsonInferenceResultChunk {
-    pub raw: String,
+    pub raw: Option<String>,
+    pub thought: Option<String>,
     pub created: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -329,10 +527,14 @@ pub struct ChatInferenceDatabaseInsert {
     pub function_name: String,
     pub variant_name: String,
     pub episode_id: Uuid,
-    pub input: Input,
-    pub output: Vec<ContentBlockOutput>,
+    #[serde(deserialize_with = "deserialize_json_string")]
+    pub input: ResolvedInput,
+    #[serde(deserialize_with = "deserialize_json_string")]
+    pub output: Vec<ContentBlockChatOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_optional_json_string")]
     pub tool_params: Option<ToolCallConfigDatabaseInsert>,
+    #[serde(deserialize_with = "deserialize_json_string")]
     pub inference_params: InferenceParams,
     pub processing_time_ms: Option<u32>,
     pub tags: HashMap<String, String>,
@@ -344,15 +546,18 @@ pub struct JsonInferenceDatabaseInsert {
     pub function_name: String,
     pub variant_name: String,
     pub episode_id: Uuid,
-    pub input: Input,
+    #[serde(deserialize_with = "deserialize_json_string")]
+    pub input: ResolvedInput,
+    #[serde(deserialize_with = "deserialize_json_string")]
     pub output: JsonInferenceOutput,
+    #[serde(deserialize_with = "deserialize_json_string")]
     pub inference_params: InferenceParams,
     pub processing_time_ms: Option<u32>,
     pub output_schema: Value,
     pub tags: HashMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum InferenceDatabaseInsert {
     Chat(ChatInferenceDatabaseInsert),
@@ -368,8 +573,8 @@ pub struct ModelInferenceDatabaseInsert {
     pub system: Option<String>,
     pub input_messages: String,
     pub output: String,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
     pub response_time_ms: Option<u32>,
     pub model_name: String,
     pub model_provider_name: String,
@@ -380,65 +585,49 @@ pub struct ModelInferenceDatabaseInsert {
 #[cfg(test)]
 impl From<String> for InputMessageContent {
     fn from(text: String) -> Self {
-        InputMessageContent::Text {
+        InputMessageContent::Text(TextKind::Text { text })
+    }
+}
+
+#[cfg(test)]
+impl From<String> for ResolvedInputMessageContent {
+    fn from(text: String) -> Self {
+        ResolvedInputMessageContent::Text {
             value: Value::String(text),
         }
     }
 }
 
 #[cfg(any(test, feature = "e2e_tests"))]
-impl From<String> for ContentBlockOutput {
+impl From<String> for ContentBlockChatOutput {
     fn from(text: String) -> Self {
-        ContentBlockOutput::Text(Text { text })
+        ContentBlockChatOutput::Text(Text { text })
     }
 }
 
-impl From<Value> for InputMessageContent {
+impl From<Value> for ResolvedInputMessageContent {
     fn from(value: Value) -> Self {
-        InputMessageContent::Text { value }
+        ResolvedInputMessageContent::Text { value }
     }
 }
 
-impl<'de> Deserialize<'de> for InputMessage {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Helper {
-            role: Role,
-            content: ContentHelper,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum ContentHelper {
-            Single(String),
-            Object(serde_json::Map<String, Value>),
-            Multiple(Vec<InputMessageContent>),
-        }
-
-        let helper = Helper::deserialize(deserializer)?;
-
-        let content = match helper.content {
-            ContentHelper::Single(text) => {
-                vec![InputMessageContent::Text {
-                    value: Value::String(text),
-                }]
-            }
-            ContentHelper::Object(object) => {
-                vec![InputMessageContent::Text {
-                    value: Value::Object(object),
-                }]
-            }
-            ContentHelper::Multiple(content) => content,
-        };
-
-        Ok(InputMessage {
-            role: helper.role,
-            content,
+fn deserialize_content<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<InputMessageContent>, D::Error> {
+    UntaggedEnumVisitor::new()
+        .string(|text| {
+            Ok(vec![InputMessageContent::Text(TextKind::Text {
+                text: text.to_string(),
+            })])
         })
-    }
+        .map(|object| {
+            tracing::warn!("Deprecation warning - passing in an object for `content` is deprecated. Please use an array of content blocks instead.");
+            Ok(vec![InputMessageContent::Text(TextKind::Arguments {
+                arguments: object.deserialize()?,
+            })])
+        })
+        .seq(|seq| seq.deserialize())
+        .deserialize(deserializer)
 }
 
 impl fmt::Display for Role {
@@ -453,6 +642,12 @@ impl fmt::Display for Role {
 impl From<String> for ContentBlock {
     fn from(text: String) -> Self {
         ContentBlock::Text(Text { text })
+    }
+}
+
+impl From<String> for ContentBlockOutput {
+    fn from(text: String) -> Self {
+        ContentBlockOutput::Text(Text { text })
     }
 }
 
@@ -539,6 +734,22 @@ impl ModelInferenceDatabaseInsert {
         };
         let serialized_input_messages = serialize_or_log(&result.input_messages);
         let serialized_output = serialize_or_log(&result.output);
+
+        // A usage of 0 indicates that something went wrong, since a model
+        // should always consume and produce at least one token.
+        // We store this as `null` in ClickHouse, so that we can easily filter
+        // out these values from aggregation queries.
+        let input_tokens = if result.usage.input_tokens > 0 {
+            Some(result.usage.input_tokens)
+        } else {
+            None
+        };
+        let output_tokens = if result.usage.output_tokens > 0 {
+            Some(result.usage.output_tokens)
+        } else {
+            None
+        };
+
         Self {
             id: Uuid::now_v7(),
             inference_id,
@@ -547,8 +758,8 @@ impl ModelInferenceDatabaseInsert {
             system: result.system,
             input_messages: serialized_input_messages,
             output: serialized_output,
-            input_tokens: result.usage.input_tokens,
-            output_tokens: result.usage.output_tokens,
+            input_tokens,
+            output_tokens,
             response_time_ms: latency_ms,
             ttft_ms,
             model_provider_name: result.model_provider_name.to_string(),
@@ -560,7 +771,7 @@ impl ModelInferenceDatabaseInsert {
 
 impl ProviderInferenceResponse {
     pub fn new(
-        output: Vec<ContentBlock>,
+        output: Vec<ContentBlockOutput>,
         system: Option<String>,
         input_messages: Vec<RequestMessage>,
         raw_request: String,
@@ -568,13 +779,14 @@ impl ProviderInferenceResponse {
         usage: Usage,
         latency: Latency,
     ) -> Self {
+        let sanitized_raw_request = sanitize_raw_request(&input_messages, raw_request);
         Self {
             id: Uuid::now_v7(),
             created: current_timestamp(),
             output,
             system,
             input_messages,
-            raw_request,
+            raw_request: sanitized_raw_request,
             raw_response,
             usage,
             latency,
@@ -600,7 +812,18 @@ impl InferenceResult {
             .iter()
             .map(|r| {
                 let model_inference = ModelInferenceDatabaseInsert::new(r.clone(), inference_id);
-                serde_json::to_value(model_inference).unwrap_or_default()
+                match serde_json::to_value(model_inference) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ErrorDetails::Serialization {
+                            message: format!(
+                                "Failed to serialize ModelInferenceDatabaseInsert: {e:?}"
+                            ),
+                        }
+                        .log();
+                        Default::default()
+                    }
+                }
             })
             .collect()
     }
@@ -635,6 +858,7 @@ impl InferenceResult {
 }
 
 impl JsonInferenceResult {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inference_id: Uuid,
         raw: String,
@@ -660,7 +884,7 @@ impl JsonInferenceResult {
 impl ChatInferenceResult {
     pub async fn new(
         inference_id: Uuid,
-        raw_content: Vec<ContentBlock>,
+        raw_content: Vec<ContentBlockOutput>,
         usage: Usage,
         model_inference_results: Vec<ModelInferenceResponseWithMetadata>,
         tool_config: Option<&ToolCallConfig>,
@@ -680,9 +904,9 @@ impl ChatInferenceResult {
 }
 
 pub async fn parse_chat_output(
-    content: Vec<ContentBlock>,
+    content: Vec<ContentBlockOutput>,
     tool_config: Option<&ToolCallConfig>,
-) -> Vec<ContentBlockOutput> {
+) -> Vec<ContentBlockChatOutput> {
     if content.is_empty() {
         Error::new(ErrorDetails::Inference {
             message: "No content blocks in inference result".to_string(),
@@ -692,19 +916,24 @@ pub async fn parse_chat_output(
     let mut output = Vec::new();
     for content in content.into_iter() {
         match content {
-            ContentBlock::Text(text) => {
-                output.push(ContentBlockOutput::Text(text));
+            ContentBlockOutput::Text(text) => {
+                output.push(ContentBlockChatOutput::Text(text));
             }
-            ContentBlock::ToolCall(tool_call) => {
+            ContentBlockOutput::ToolCall(tool_call) => {
                 // Parse the tool call arguments
                 let tool_call_output = ToolCallOutput::new(tool_call, tool_config).await;
-                output.push(ContentBlockOutput::ToolCall(tool_call_output));
+                output.push(ContentBlockChatOutput::ToolCall(tool_call_output));
             }
-            ContentBlock::ToolResult(tool_result) => {
-                Error::new(ErrorDetails::OutputParsing {
-                    message: "Tool results are not supported in output for Chat functions"
-                        .to_string(),
-                    raw_output: serde_json::to_string(&tool_result).unwrap_or_default(),
+            ContentBlockOutput::Thought(thought) => {
+                output.push(ContentBlockChatOutput::Thought(thought));
+            }
+            ContentBlockOutput::Unknown {
+                data,
+                model_provider_name,
+            } => {
+                output.push(ContentBlockChatOutput::Unknown {
+                    data,
+                    model_provider_name,
                 });
             }
         }
@@ -715,7 +944,7 @@ pub async fn parse_chat_output(
 impl ChatInferenceDatabaseInsert {
     pub fn new(
         chat_result: ChatInferenceResult,
-        input: Input,
+        input: ResolvedInput,
         metadata: InferenceDatabaseInsertMetadata,
     ) -> Self {
         let processing_time_ms = metadata
@@ -743,7 +972,7 @@ impl ChatInferenceDatabaseInsert {
 impl JsonInferenceDatabaseInsert {
     pub fn new(
         json_result: JsonInferenceResult,
-        input: Input,
+        input: ResolvedInput,
         metadata: InferenceDatabaseInsertMetadata,
     ) -> Self {
         let processing_time_ms = metadata
@@ -847,13 +1076,21 @@ impl From<ToolCallOutput> for ToolCall {
     }
 }
 
-impl From<ContentBlockOutput> for ContentBlock {
-    fn from(output: ContentBlockOutput) -> Self {
+impl From<ContentBlockChatOutput> for ContentBlock {
+    fn from(output: ContentBlockChatOutput) -> Self {
         match output {
-            ContentBlockOutput::Text(text) => ContentBlock::Text(text),
-            ContentBlockOutput::ToolCall(tool_call_output) => {
+            ContentBlockChatOutput::Text(text) => ContentBlock::Text(text),
+            ContentBlockChatOutput::ToolCall(tool_call_output) => {
                 ContentBlock::ToolCall(tool_call_output.into())
             }
+            ContentBlockChatOutput::Thought(thought) => ContentBlock::Thought(thought),
+            ContentBlockChatOutput::Unknown {
+                data,
+                model_provider_name,
+            } => ContentBlock::Unknown {
+                data,
+                model_provider_name,
+            },
         }
     }
 }
@@ -863,15 +1100,23 @@ impl From<ContentBlockOutput> for ContentBlock {
 /// We take the string from either of these (from the last block if there are multiple)
 /// and use that as the raw response.
 impl From<ProviderInferenceResponseChunk> for JsonInferenceResultChunk {
-    fn from(mut chunk: ProviderInferenceResponseChunk) -> Self {
-        let raw = match chunk.content.pop() {
-            Some(ContentBlockChunk::ToolCall(tool_call)) => tool_call.raw_arguments.to_owned(),
-            Some(ContentBlockChunk::Text(text)) => text.text.to_owned(),
-            None => String::new(),
-        };
-
+    fn from(chunk: ProviderInferenceResponseChunk) -> Self {
+        let mut raw = None;
+        let mut thought = None;
+        for content in chunk.content.into_iter() {
+            match content {
+                ContentBlockChunk::ToolCall(tool_call) => {
+                    raw = Some(tool_call.raw_arguments.to_owned())
+                }
+                ContentBlockChunk::Text(text_chunk) => raw = Some(text_chunk.text.to_owned()),
+                ContentBlockChunk::Thought(thought_chunk) => {
+                    thought = Some(thought_chunk.text.to_owned())
+                }
+            }
+        }
         Self {
             raw,
+            thought,
             created: chunk.created,
             usage: chunk.usage,
             latency: chunk.latency,
@@ -923,8 +1168,9 @@ pub async fn collect_chunks(args: CollectChunksArgs<'_, '_>) -> Result<Inference
     } = args;
 
     // NOTE: We will eventually need this to be per-inference-response-type and sensitive to the type of variant and function being called.
-    let mut tool_call_blocks: HashMap<String, ContentBlock> = HashMap::new();
-    let mut text_blocks: HashMap<String, ContentBlock> = HashMap::new();
+    let mut tool_call_blocks: HashMap<String, ContentBlockOutput> = HashMap::new();
+    let mut text_blocks: HashMap<String, ContentBlockOutput> = HashMap::new();
+    let mut thought_blocks: HashMap<String, ContentBlockOutput> = HashMap::new();
     let raw_response: String = value
         .iter()
         .map(|chunk| chunk.raw_response())
@@ -954,28 +1200,42 @@ pub async fn collect_chunks(args: CollectChunksArgs<'_, '_>) -> Result<Inference
                 for content in chunk.content {
                     match content {
                         ContentBlockChunk::Text(text) => {
-                            match text_blocks.get_mut(&text.id) {
-                                // If there is already a text block, append to it
-                                Some(ContentBlock::Text(Text {
-                                    text: existing_text,
-                                })) => {
-                                    existing_text.push_str(&text.text);
-                                }
-                                // If there is no text block, create one
-                                _ => {
-                                    // We put this here and below rather than in the loop start because we
-                                    // only want to set TTFT if there is some real content
-                                    if ttft.is_none() {
-                                        ttft = Some(chunk.latency);
+                            handle_textual_content_block(
+                                &mut text_blocks,
+                                text.id,
+                                text.text,
+                                &mut ttft,
+                                chunk.latency,
+                                |text| text.into(),
+                                |block, text| {
+                                    if let ContentBlockOutput::Text(Text {
+                                        text: existing_text,
+                                    }) = block
+                                    {
+                                        existing_text.push_str(text);
                                     }
-                                    text_blocks.insert(text.id, text.text.into());
-                                }
-                            }
+                                },
+                            );
+                        }
+                        ContentBlockChunk::Thought(thought) => {
+                            handle_textual_content_block(
+                                &mut thought_blocks,
+                                thought.id,
+                                thought.text,
+                                &mut ttft,
+                                chunk.latency,
+                                |text| ContentBlockOutput::Thought(Thought { text }),
+                                |block, text| {
+                                    if let ContentBlockOutput::Thought(thought) = block {
+                                        thought.text.push_str(text);
+                                    }
+                                },
+                            );
                         }
                         ContentBlockChunk::ToolCall(tool_call) => {
                             match tool_call_blocks.get_mut(&tool_call.id) {
                                 // If there is already a tool call block with this id, append to it
-                                Some(ContentBlock::ToolCall(existing_tool_call)) => {
+                                Some(ContentBlockOutput::ToolCall(existing_tool_call)) => {
                                     // We assume that the name and ID are present and complete in the first chunk
                                     existing_tool_call
                                         .arguments
@@ -988,7 +1248,7 @@ pub async fn collect_chunks(args: CollectChunksArgs<'_, '_>) -> Result<Inference
                                     }
                                     tool_call_blocks.insert(
                                         tool_call.id.clone(),
-                                        ContentBlock::ToolCall(tool_call.into()),
+                                        ContentBlockOutput::ToolCall(tool_call.into()),
                                     );
                                 }
                             }
@@ -999,10 +1259,12 @@ pub async fn collect_chunks(args: CollectChunksArgs<'_, '_>) -> Result<Inference
             InferenceResultChunk::Json(chunk) => {
                 match text_blocks.get_mut("") {
                     // If there is already a text block, append to it
-                    Some(ContentBlock::Text(Text {
+                    Some(ContentBlockOutput::Text(Text {
                         text: existing_text,
                     })) => {
-                        existing_text.push_str(&chunk.raw);
+                        if let Some(raw) = chunk.raw {
+                            existing_text.push_str(&raw);
+                        }
                     }
                     // If there is no text block, create one
                     _ => {
@@ -1011,13 +1273,29 @@ pub async fn collect_chunks(args: CollectChunksArgs<'_, '_>) -> Result<Inference
                         if ttft.is_none() {
                             ttft = Some(chunk.latency);
                         }
-                        text_blocks.insert("".to_string(), chunk.raw.into());
+                        if let Some(raw) = chunk.raw {
+                            text_blocks.insert(String::new(), raw.into());
+                        }
+                    }
+                }
+                if let Some(thought) = chunk.thought {
+                    match thought_blocks.get_mut("") {
+                        // If there is already a thought block, append to it
+                        Some(ContentBlockOutput::Thought(existing_thought)) => {
+                            existing_thought.text.push_str(&thought);
+                        }
+                        // If there is no thought block, create one
+                        _ => {
+                            thought_blocks.insert(
+                                String::new(),
+                                ContentBlockOutput::Thought(Thought { text: thought }),
+                            );
+                        }
                     }
                 }
             }
         }
     }
-
     let ttft = ttft.ok_or_else(|| {
         Error::new(ErrorDetails::TypeConversion {
             message: "Never got TTFT because there was never content in the response.".to_string(),
@@ -1027,7 +1305,8 @@ pub async fn collect_chunks(args: CollectChunksArgs<'_, '_>) -> Result<Inference
         ttft,
         response_time,
     };
-    let mut content_blocks: Vec<ContentBlock> = tool_call_blocks.into_values().collect();
+    let mut content_blocks: Vec<ContentBlockOutput> = tool_call_blocks.into_values().collect();
+    content_blocks.extend(thought_blocks.into_values());
     content_blocks.extend(text_blocks.into_values());
     let model_response = ProviderInferenceResponse::new(
         content_blocks.clone(),
@@ -1154,6 +1433,38 @@ pub fn serialize_or_log<T: Serialize>(value: &T) -> String {
     }
 }
 
+/// Handles a textual content block (text or thought)
+/// It checks if there is already a block with the given id, and if so, appends the text to it.
+/// Otherwise, it creates a new block and inserts it into the map.
+/// It also updates the TTFT if it hasn't been set
+fn handle_textual_content_block<F, A>(
+    blocks: &mut HashMap<String, ContentBlockOutput>,
+    id: String,
+    text: String,
+    ttft: &mut Option<Duration>,
+    chunk_latency: Duration,
+    create_block: F,
+    append_text: A,
+) where
+    F: FnOnce(String) -> ContentBlockOutput,
+    A: FnOnce(&mut ContentBlockOutput, &str),
+{
+    match blocks.get_mut(&id) {
+        // If there is already a block, append to it
+        Some(existing_block) => append_text(existing_block, &text),
+        // If there is no block, create one
+        _ => {
+            // We only want to set TTFT if there is some real content
+            if ttft.is_none() {
+                *ttft = Some(chunk_latency);
+            }
+            if !text.is_empty() {
+                blocks.insert(id, create_block(text));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,7 +1529,7 @@ mod tests {
 
         // Case 2: A tool call that fails argument validation
         let inference_id = Uuid::now_v7();
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "get_temperature".to_string(),
             arguments: r#"{"where": "the moon"}"#.to_string(),
             id: "0".to_string(),
@@ -1253,7 +1564,7 @@ mod tests {
         assert_eq!(chat_inference_response.content.len(), 1);
         let tool_call_block = chat_inference_response.content.first().unwrap();
         match tool_call_block {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_temperature");
                 assert_eq!(tool_call.raw_arguments, r#"{"where": "the moon"}"#);
                 assert_eq!(tool_call.id, "0");
@@ -1265,7 +1576,7 @@ mod tests {
 
         // Case 3: A tool call that fails name validation
         let inference_id = Uuid::now_v7();
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "bad name".to_string(),
             arguments: r#"{"where": "the moon"}"#.to_string(),
             id: "0".to_string(),
@@ -1299,7 +1610,7 @@ mod tests {
         assert_eq!(chat_inference_response.content.len(), 1);
         let tool_call_block = chat_inference_response.content.first().unwrap();
         match tool_call_block {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "bad name");
                 assert_eq!(tool_call.raw_arguments, r#"{"where": "the moon"}"#);
                 assert_eq!(tool_call.id, "0");
@@ -1311,7 +1622,7 @@ mod tests {
 
         // Case 4: A tool call that passes validation
         let inference_id = Uuid::now_v7();
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "get_temperature".to_string(),
             arguments: r#"{"location": "the moon", "units": "celsius"}"#.to_string(),
             id: "0".to_string(),
@@ -1345,7 +1656,7 @@ mod tests {
         assert_eq!(chat_inference_response.content.len(), 1);
         let tool_call_block = chat_inference_response.content.first().unwrap();
         match tool_call_block {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_temperature");
                 assert_eq!(
                     tool_call.raw_arguments,
@@ -1367,12 +1678,12 @@ mod tests {
         // Case 5: Parallel tool calls
         let inference_id = Uuid::now_v7();
         let content = vec![
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location": "moon", "units": "celsius"}"#.to_string(),
                 id: "0".to_string(),
             }),
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location": "mars", "units": "celsius"}"#.to_string(),
                 id: "1".to_string(),
@@ -1408,7 +1719,7 @@ mod tests {
 
         // Verify first tool call
         match &chat_inference_response.content[0] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_temperature");
                 assert_eq!(
                     tool_call.raw_arguments,
@@ -1429,7 +1740,7 @@ mod tests {
 
         // Verify second tool call
         match &chat_inference_response.content[1] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_temperature");
                 assert_eq!(
                     tool_call.raw_arguments,
@@ -1451,12 +1762,12 @@ mod tests {
         // Case 5b: Parallel tool calls with one invalid call
         let inference_id = Uuid::now_v7();
         let content = vec![
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location": "moon", "units": "celsius"}"#.to_string(),
                 id: "0".to_string(),
             }),
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 name: "get_temperature".to_string(),
                 arguments: r#"{"invalid": "args"}"#.to_string(),
                 id: "1".to_string(),
@@ -1492,7 +1803,7 @@ mod tests {
 
         // Verify first tool call (valid)
         match &chat_inference_response.content[0] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_temperature");
                 assert_eq!(
                     tool_call.raw_arguments,
@@ -1513,7 +1824,7 @@ mod tests {
 
         // Verify second tool call (invalid arguments)
         match &chat_inference_response.content[1] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_temperature");
                 assert_eq!(tool_call.raw_arguments, r#"{"invalid": "args"}"#);
                 assert_eq!(tool_call.id, "1");
@@ -1548,7 +1859,7 @@ mod tests {
         };
 
         // Test valid arguments for additional tool
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "custom_tool".to_string(),
             arguments: r#"{"input": "test"}"#.to_string(),
             id: "0".to_string(),
@@ -1583,7 +1894,7 @@ mod tests {
 
         // Verify valid tool call
         match &chat_inference_response.content[0] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "custom_tool");
                 assert_eq!(tool_call.raw_arguments, r#"{"input": "test"}"#);
                 assert_eq!(tool_call.id, "0");
@@ -1597,7 +1908,7 @@ mod tests {
         }
 
         // Test invalid arguments for additional tool
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "custom_tool".to_string(),
             arguments: r#"{"wrong": "field"}"#.to_string(),
             id: "1".to_string(),
@@ -1632,7 +1943,7 @@ mod tests {
 
         // Verify invalid tool call
         match &chat_inference_response.content[0] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "custom_tool");
                 assert_eq!(tool_call.raw_arguments, r#"{"wrong": "field"}"#);
                 assert_eq!(tool_call.id, "1");
@@ -1668,7 +1979,7 @@ mod tests {
         };
 
         // Test allowed tool call
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "weather_tool".to_string(),
             arguments: r#"{"location": "moon", "units": "celsius"}"#.to_string(),
             id: "0".to_string(),
@@ -1703,7 +2014,7 @@ mod tests {
 
         // Verify allowed tool call
         match &chat_inference_response.content[0] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "weather_tool");
                 assert_eq!(
                     tool_call.raw_arguments,
@@ -1723,7 +2034,7 @@ mod tests {
         }
 
         // Test disallowed tool call
-        let content = vec![ContentBlock::ToolCall(ToolCall {
+        let content = vec![ContentBlockOutput::ToolCall(ToolCall {
             name: "get_humidity".to_string(), // This tool is not in the restricted config
             arguments: r#"{"location": "moon"}"#.to_string(),
             id: "1".to_string(),
@@ -1758,7 +2069,7 @@ mod tests {
 
         // Verify disallowed tool call
         match &chat_inference_response.content[0] {
-            ContentBlockOutput::ToolCall(tool_call) => {
+            ContentBlockChatOutput::ToolCall(tool_call) => {
                 assert_eq!(tool_call.raw_name, "get_humidity");
                 assert_eq!(tool_call.raw_arguments, r#"{"location": "moon"}"#);
                 assert_eq!(tool_call.id, "1");
@@ -1913,14 +2224,16 @@ mod tests {
         };
         let chunks = vec![
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "{\"name\":".to_string(),
+                raw: Some("{\"name\":".to_string()),
+                thought: Some("Thought 1".to_string()),
                 created,
                 usage: Some(usage1.clone()),
                 raw_response: "{\"name\":".to_string(),
                 latency: Duration::from_millis(150),
             }),
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "\"John\",\"age\":30}".to_string(),
+                raw: Some("\"John\",\"age\":30}".to_string()),
+                thought: Some("Thought 2".to_string()),
                 created,
                 usage: Some(usage2.clone()),
                 raw_response: "\"John\",\"age\":30}".to_string(),
@@ -1985,14 +2298,16 @@ mod tests {
         };
         let chunks = vec![
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "{\"name\":".to_string(),
+                raw: Some("{\"name\":".to_string()),
+                thought: Some("Thought 1".to_string()),
                 created,
                 usage: Some(usage.clone()),
                 raw_response: "{\"name\":".to_string(),
                 latency: Duration::from_millis(100),
             }),
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "\"John\"}".to_string(),
+                raw: Some("\"John\"}".to_string()),
+                thought: None,
                 created,
                 usage: None,
                 raw_response: "\"John\"}".to_string(),
@@ -2048,21 +2363,24 @@ mod tests {
         };
         let chunks = vec![
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "{\"name\":\"John\",".to_string(),
+                raw: Some("{\"name\":\"John\",".to_string()),
+                thought: None,
                 created,
                 usage: Some(usage.clone()),
                 raw_response: "{\"name\":\"John\",".to_string(),
                 latency: Duration::from_millis(100),
             }),
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "".to_string(),
+                raw: Some("".to_string()),
+                thought: Some("Thought 2".to_string()),
                 created,
                 usage: None,
                 raw_response: "".to_string(),
                 latency: Duration::from_millis(200),
             }),
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "\"age\":30}".to_string(),
+                raw: Some("\"age\":30}".to_string()),
+                thought: None,
                 created,
                 usage: None,
                 raw_response: "\"age\":30}".to_string(),
@@ -2093,7 +2411,14 @@ mod tests {
             assert_eq!(chat_response.created, created);
             assert_eq!(
                 chat_response.content,
-                vec!["{\"name\":\"John\",\"age\":30}".to_string().into()]
+                vec![
+                    ContentBlockChatOutput::Thought(Thought {
+                        text: "Thought 2".to_string()
+                    }),
+                    ContentBlockChatOutput::Text(Text {
+                        text: "{\"name\":\"John\",\"age\":30}".to_string()
+                    }),
+                ]
             );
             assert_eq!(chat_response.usage, usage);
             assert_eq!(chat_response.model_inference_results.len(), 1);
@@ -2139,14 +2464,16 @@ mod tests {
         };
         let chunks = vec![
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "{\"name\":".to_string(),
+                raw: Some("{\"name\":".to_string()),
+                thought: Some("Thought 1".to_string()),
                 created,
                 usage: Some(usage1.clone()),
                 raw_response: "{\"name\":".to_string(),
                 latency: Duration::from_millis(150),
             }),
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "\"John\",\"age\":30}".to_string(),
+                raw: Some("\"John\",\"age\":30}".to_string()),
+                thought: Some("Thought 2".to_string()),
                 created,
                 usage: Some(usage2.clone()),
                 raw_response: "\"John\",\"age\":30}".to_string(),
@@ -2239,14 +2566,16 @@ mod tests {
         let templates = TemplateConfig::default();
         let chunks = vec![
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "{\"name\":".to_string(),
+                raw: Some("{\"name\":".to_string()),
+                thought: Some("Thought 1".to_string()),
                 created,
                 usage: Some(usage1.clone()),
                 raw_response: "{\"name\":".to_string(),
                 latency: Duration::from_millis(150),
             }),
             InferenceResultChunk::Json(JsonInferenceResultChunk {
-                raw: "\"John\",\"age\":30}".to_string(),
+                raw: Some("\"John\",\"age\":30}".to_string()),
+                thought: Some("Thought 2".to_string()),
                 created,
                 usage: Some(usage2.clone()),
                 raw_response: "\"John\",\"age\":30}".to_string(),
@@ -2314,8 +2643,10 @@ mod tests {
         assert_eq!(message.role, Role::User);
         assert_eq!(message.content.len(), 1);
         match &message.content[0] {
-            InputMessageContent::Text { value } => assert_eq!(value, "Hello, world!"),
-            _ => panic!("Expected Text content"),
+            InputMessageContent::Text(TextKind::Text { text }) => {
+                assert_eq!(text, "Hello, world!")
+            }
+            _ => panic!("Expected Text content: {message:?}"),
         }
 
         // Test case for object content
@@ -2327,8 +2658,8 @@ mod tests {
         assert_eq!(message.role, Role::Assistant);
         assert_eq!(message.content.len(), 1);
         match &message.content[0] {
-            InputMessageContent::Text { value } => {
-                assert_eq!(value, &json!({"key": "value"}))
+            InputMessageContent::Text(TextKind::Arguments { arguments }) => {
+                assert_eq!(arguments, json!({"key": "value"}).as_object().unwrap())
             }
             _ => panic!("Expected Text content"),
         }
@@ -2345,7 +2676,9 @@ mod tests {
         assert_eq!(message.role, Role::User);
         assert_eq!(message.content.len(), 2);
         match &message.content[0] {
-            InputMessageContent::Text { value } => assert_eq!(value, "Hello"),
+            InputMessageContent::Text(TextKind::LegacyValue { value }) => {
+                assert_eq!(value, "Hello")
+            }
             _ => panic!("Expected Text content"),
         }
         match &message.content[1] {
@@ -2368,7 +2701,7 @@ mod tests {
         assert_eq!(message.role, Role::User);
         assert_eq!(message.content.len(), 2);
         match &message.content[0] {
-            InputMessageContent::Text { value } => {
+            InputMessageContent::Text(TextKind::LegacyValue { value }) => {
                 assert_eq!(
                     value,
                     &json!({"complex": "json", "with": ["nested", "array"]})
@@ -2419,5 +2752,209 @@ mod tests {
             "content": [{"type": "invalid_type", "value": "test"}]
         });
         assert!(serde_json::from_value::<InputMessage>(input).is_err());
+    }
+
+    #[test]
+    fn test_json_inference_result_chunk_from_provider_chunk() {
+        use std::time::Duration;
+
+        // Test case for ToolCall content
+        let tool_chunk = ProviderInferenceResponseChunk {
+            content: vec![ContentBlockChunk::ToolCall(ToolCallChunk {
+                id: "123".to_string(),
+                raw_arguments: "{\"key\": \"value\"}".to_string(),
+                raw_name: "test_tool".to_string(),
+            })],
+            created: 1234567890,
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 20,
+            }),
+            raw_response: "raw response".to_string(),
+            latency: Duration::from_secs(1),
+        };
+
+        let result = JsonInferenceResultChunk::from(tool_chunk);
+        assert_eq!(result.raw, Some("{\"key\": \"value\"}".to_string()));
+        assert_eq!(result.thought, None);
+        assert_eq!(result.created, 1234567890);
+        assert_eq!(result.raw_response, "raw response");
+        assert_eq!(result.latency, Duration::from_secs(1));
+        assert_eq!(
+            result.usage,
+            Some(Usage {
+                input_tokens: 10,
+                output_tokens: 20
+            })
+        );
+
+        // Test case for Text content
+        let text_chunk = ProviderInferenceResponseChunk {
+            content: vec![ContentBlockChunk::Text(TextChunk {
+                id: "123".to_string(),
+                text: "some text".to_string(),
+            })],
+            created: 1234567890,
+            usage: None,
+            raw_response: "raw response".to_string(),
+            latency: Duration::from_secs(1),
+        };
+
+        let result = JsonInferenceResultChunk::from(text_chunk);
+        assert_eq!(result.raw, Some("some text".to_string()));
+        assert_eq!(result.thought, None);
+
+        // Test case for Thought content
+        let thought_chunk = ProviderInferenceResponseChunk {
+            content: vec![ContentBlockChunk::Thought(ThoughtChunk {
+                id: "123".to_string(),
+                text: "thinking...".to_string(),
+            })],
+            created: 1234567890,
+            usage: None,
+            raw_response: "raw response".to_string(),
+            latency: Duration::from_secs(1),
+        };
+
+        let result = JsonInferenceResultChunk::from(thought_chunk);
+        assert_eq!(result.raw, None);
+        assert_eq!(result.thought, Some("thinking...".to_string()));
+
+        // Test case for multiple content blocks - should use last raw content
+        let mixed_chunk = ProviderInferenceResponseChunk {
+            content: vec![
+                ContentBlockChunk::Text(TextChunk {
+                    id: "123".to_string(),
+                    text: "first text".to_string(),
+                }),
+                ContentBlockChunk::ToolCall(ToolCallChunk {
+                    id: "456".to_string(),
+                    raw_arguments: "final content".to_string(),
+                    raw_name: "test_tool".to_string(),
+                }),
+                ContentBlockChunk::Thought(ThoughtChunk {
+                    id: "789".to_string(),
+                    text: "final thought".to_string(),
+                }),
+            ],
+            created: 1234567890,
+            usage: None,
+            raw_response: "raw response".to_string(),
+            latency: Duration::from_secs(1),
+        };
+
+        let result = JsonInferenceResultChunk::from(mixed_chunk);
+        assert_eq!(result.raw, Some("final content".to_string()));
+        assert_eq!(result.thought, Some("final thought".to_string()));
+
+        // Test case for empty content
+        let empty_chunk = ProviderInferenceResponseChunk {
+            content: vec![],
+            created: 1234567890,
+            usage: None,
+            raw_response: "raw response".to_string(),
+            latency: Duration::from_secs(1),
+        };
+
+        let result = JsonInferenceResultChunk::from(empty_chunk);
+        assert_eq!(result.raw, None);
+        assert_eq!(result.thought, None);
+    }
+
+    #[test]
+    fn test_handle_textual_content_block() {
+        let mut blocks: HashMap<String, ContentBlockOutput> = HashMap::new();
+        let mut ttft: Option<Duration> = None;
+        let chunk_latency = Duration::from_millis(100);
+
+        // Test case 1: Create new text block
+        handle_textual_content_block(
+            &mut blocks,
+            "1".to_string(),
+            "Hello".to_string(),
+            &mut ttft,
+            chunk_latency,
+            |text| ContentBlockOutput::Text(Text { text }),
+            |block, text| {
+                if let ContentBlockOutput::Text(Text {
+                    text: existing_text,
+                }) = block
+                {
+                    existing_text.push_str(text);
+                }
+            },
+        );
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(ttft, Some(chunk_latency));
+        match blocks.get("1").unwrap() {
+            ContentBlockOutput::Text(Text { text }) => assert_eq!(text, "Hello"),
+            _ => panic!("Expected text block"),
+        }
+
+        // Test case 2: Append to existing text block
+        handle_textual_content_block(
+            &mut blocks,
+            "1".to_string(),
+            " World".to_string(),
+            &mut ttft,
+            chunk_latency,
+            |text| ContentBlockOutput::Text(Text { text }),
+            |block, text| {
+                if let ContentBlockOutput::Text(Text {
+                    text: existing_text,
+                }) = block
+                {
+                    existing_text.push_str(text);
+                }
+            },
+        );
+
+        assert_eq!(blocks.len(), 1);
+        match blocks.get("1").unwrap() {
+            ContentBlockOutput::Text(Text { text }) => assert_eq!(text, "Hello World"),
+            _ => panic!("Expected text block"),
+        }
+
+        // Test case 3: Empty text should not create block
+        handle_textual_content_block(
+            &mut blocks,
+            "2".to_string(),
+            "".to_string(),
+            &mut ttft,
+            chunk_latency,
+            |text| ContentBlockOutput::Text(Text { text }),
+            |block, text| {
+                if let ContentBlockOutput::Text(Text {
+                    text: existing_text,
+                }) = block
+                {
+                    existing_text.push_str(text);
+                }
+            },
+        );
+
+        assert_eq!(blocks.len(), 1); // Should still only have the first block
+
+        // Test case 4: Create thought block
+        handle_textual_content_block(
+            &mut blocks,
+            "3".to_string(),
+            "Thinking...".to_string(),
+            &mut ttft,
+            chunk_latency,
+            |text| ContentBlockOutput::Thought(Thought { text }),
+            |block, text| {
+                if let ContentBlockOutput::Thought(thought) = block {
+                    thought.text.push_str(text);
+                }
+            },
+        );
+
+        assert_eq!(blocks.len(), 2);
+        match blocks.get("3").unwrap() {
+            ContentBlockOutput::Thought(Thought { text }) => assert_eq!(text, "Thinking..."),
+            _ => panic!("Expected thought block"),
+        }
     }
 }

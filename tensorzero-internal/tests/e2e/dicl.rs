@@ -10,8 +10,8 @@ use tensorzero_internal::{
     embeddings::{EmbeddingProvider, EmbeddingProviderConfig, EmbeddingRequest},
     endpoints::inference::InferenceCredentials,
     inference::types::{
-        ContentBlock, ContentBlockOutput, Input, InputMessage, InputMessageContent,
-        JsonInferenceOutput, RequestMessage, Role,
+        ContentBlock, ContentBlockChatOutput, JsonInferenceOutput, RequestMessage, ResolvedInput,
+        ResolvedInputMessage, ResolvedInputMessageContent, Role,
     },
 };
 use tokio::time::sleep;
@@ -27,11 +27,108 @@ pub async fn test_dicl_inference_request_no_examples_empty_dicl() {
     test_dicl_inference_request_no_examples("empty_dicl").await;
 }
 
+#[tokio::test]
+pub async fn test_dicl_inference_request_no_examples_empty_dicl_extra_body() {
+    test_dicl_inference_request_no_examples("empty_dicl_extra_body").await;
+}
+
 // This model is identical to `empty_dicl`, but it specified the embedding model
 // using shorthand
 #[tokio::test]
 pub async fn test_dicl_inference_request_no_examples_empty_dicl_shorthand() {
     test_dicl_inference_request_no_examples("empty_dicl_shorthand").await;
+}
+
+#[tokio::test]
+async fn test_dicl_reject_unknown_content_block() {
+    let episode_id = Uuid::now_v7();
+
+    let payload = json!({
+        "function_name": "basic_test",
+        "variant_name": "empty_dicl",
+        "episode_id": episode_id,
+        "input":
+            {
+               "system": {"assistant_name": "Dr. Mehta"},
+               "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "value": "What is the name of the capital city of Japan?"},
+                        {"type": "unknown", "model_provider_name": "tensorzero::model_name::gpt-4o-mini-2024-07-18::provider_name::openai", "data": {"type": "text", "text": "My extra openai text"}}
+                    ]
+                }
+            ]},
+        "stream": false,
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    // Check that the API response is correct
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let response_json = response.json::<Value>().await.unwrap();
+    assert!(
+        response_json
+            .get("error")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains(" Unsupported content block type `unknown` for provider `dicl`"),
+        "Unexpected error message: {response_json:#?}"
+    );
+
+    println!("API response: {response_json:#?}");
+}
+
+#[tokio::test]
+async fn test_dicl_reject_image_content_block() {
+    let episode_id = Uuid::now_v7();
+
+    let payload = json!({
+        "function_name": "basic_test",
+        "variant_name": "empty_dicl",
+        "episode_id": episode_id,
+        "input":
+            {
+               "system": {"assistant_name": "Dr. Mehta"},
+               "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "value": "What is the name of the capital city of Japan?"},
+                        {"type": "image", "mime_type": "image/jpeg", "data": "abc"}
+                    ]
+                }
+            ]},
+        "stream": false,
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    // Check that the API response is ok
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let response_json = response.json::<Value>().await.unwrap();
+    assert!(
+        response_json
+            .get("error")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains(" Unsupported content block type `image` for provider `dicl`"),
+        "Unexpected error message: {response_json:#?}"
+    );
+
+    println!("API response: {response_json:#?}");
 }
 
 pub async fn test_dicl_inference_request_no_examples(dicl_variant_name: &str) {
@@ -183,17 +280,21 @@ pub async fn test_dicl_inference_request_no_examples(dicl_variant_name: &str) {
                     .as_str()
                     .unwrap();
                 assert!(raw_response.to_lowercase().contains("tokyo"));
+
+                if dicl_variant_name == "empty_dicl_extra_body" {
+                    let raw_request = model_inference
+                        .get("raw_request")
+                        .unwrap()
+                        .as_str()
+                        .unwrap();
+                    let raw_request: Value = serde_json::from_str(raw_request).unwrap();
+                    let temperature = raw_request.get("temperature").unwrap().as_f64().unwrap();
+                    assert_eq!(temperature, 0.123);
+                }
             }
             "openai::text-embedding-3-small" | "text-embedding-3-small" => {
                 // The embedding call should not generate any output tokens
-                assert_eq!(
-                    model_inference
-                        .get("output_tokens")
-                        .unwrap()
-                        .as_u64()
-                        .unwrap(),
-                    0
-                );
+                assert!(model_inference.get("output_tokens").unwrap().is_null());
             }
             _ => {
                 panic!("Unexpected model: {}", model_name);
@@ -247,7 +348,7 @@ pub async fn test_dicl_inference_request_no_examples(dicl_variant_name: &str) {
 // Stick an embedding example into the database
 async fn embed_insert_example(
     clickhouse: &ClickHouseConnectionInfo,
-    input: Input,
+    input: ResolvedInput,
     output: String,
     function_name: &str,
     variant_name: &str,
@@ -311,16 +412,16 @@ pub async fn test_dicl_inference_request() {
     // Insert examples into the database
     let mut tasks = Vec::new();
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Dr. Mehta"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!("What is the boiling point of water?"),
             }],
         }],
     };
-    let output: Vec<ContentBlockOutput> = vec!["100 degrees Celsius".to_string().into()];
+    let output: Vec<ContentBlockChatOutput> = vec!["100 degrees Celsius".to_string().into()];
     let output_string = serde_json::to_string(&output).unwrap();
 
     tasks.push(embed_insert_example(
@@ -331,16 +432,16 @@ pub async fn test_dicl_inference_request() {
         variant_name,
     ));
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Pinocchio"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!("What the capital city of India?"),
             }],
         }],
     };
-    let output: Vec<ContentBlockOutput> =
+    let output: Vec<ContentBlockChatOutput> =
         vec!["Ahmedabad (nose grows 3 inches)".to_string().into()];
     let output_string = serde_json::to_string(&output).unwrap();
 
@@ -352,16 +453,16 @@ pub async fn test_dicl_inference_request() {
         variant_name,
     ));
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Pinocchio"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!("What is an example of a computationally hard problem?"),
             }],
         }],
     };
-    let output: Vec<ContentBlockOutput> = vec![
+    let output: Vec<ContentBlockChatOutput> = vec![
         "Finding the median of an unsorted list of numbers (nose grows 4 inches)"
             .to_string()
             .into(),
@@ -375,16 +476,16 @@ pub async fn test_dicl_inference_request() {
         variant_name,
     ));
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Pinocchio"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!("Who wrote Lord of the Rings?"),
             }],
         }],
     };
-    let output: Vec<ContentBlockOutput> =
+    let output: Vec<ContentBlockChatOutput> =
         vec!["J.K. Rowling (nose grows 5 inches)".to_string().into()];
     let output_string = serde_json::to_string(&output).unwrap();
     tasks.push(embed_insert_example(
@@ -573,14 +674,7 @@ pub async fn test_dicl_inference_request() {
             }
             "text-embedding-3-small" => {
                 // The embedding call should not generate any output tokens
-                assert_eq!(
-                    model_inference
-                        .get("output_tokens")
-                        .unwrap()
-                        .as_u64()
-                        .unwrap(),
-                    0
-                );
+                assert!(model_inference.get("output_tokens").unwrap().is_null());
                 assert!(model_inference.get("system").unwrap().is_null());
                 assert_eq!(input_messages.len(), 1);
                 assert_eq!(output.len(), 0);
@@ -823,14 +917,7 @@ pub async fn test_dicl_inference_request() {
             }
             "text-embedding-3-small" => {
                 // The embedding call should not generate any output tokens
-                assert_eq!(
-                    model_inference
-                        .get("output_tokens")
-                        .unwrap()
-                        .as_u64()
-                        .unwrap(),
-                    0
-                );
+                assert!(model_inference.get("output_tokens").unwrap().is_null());
                 assert!(model_inference.get("system").unwrap().is_null());
                 assert_eq!(input_messages.len(), 1);
                 assert_eq!(output.len(), 0);
@@ -893,11 +980,11 @@ async fn test_dicl_json_request() {
     // Insert examples into the database
     let mut tasks = Vec::new();
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Dr. Mehta"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!({"country": "Canada"}),
             }],
         }],
@@ -916,11 +1003,11 @@ async fn test_dicl_json_request() {
         variant_name,
     ));
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Pinocchio"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!({"country": "India"}),
             }],
         }],
@@ -939,11 +1026,11 @@ async fn test_dicl_json_request() {
         variant_name,
     ));
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Pinocchio"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!({"country": "USA"}),
             }],
         }],
@@ -961,11 +1048,11 @@ async fn test_dicl_json_request() {
         variant_name,
     ));
 
-    let input = Input {
+    let input = ResolvedInput {
         system: Some(json!({"assistant_name": "Pinocchio"})),
-        messages: vec![InputMessage {
+        messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![InputMessageContent::Text {
+            content: vec![ResolvedInputMessageContent::Text {
                 value: json!({"country": "England"}),
             }],
         }],
@@ -1154,14 +1241,7 @@ async fn test_dicl_json_request() {
             }
             "text-embedding-3-small" => {
                 // The embedding call should not generate any output tokens
-                assert_eq!(
-                    model_inference
-                        .get("output_tokens")
-                        .unwrap()
-                        .as_u64()
-                        .unwrap(),
-                    0
-                );
+                assert!(model_inference.get("output_tokens").unwrap().is_null());
                 assert!(model_inference.get("system").unwrap().is_null());
                 assert_eq!(input_messages.len(), 1);
                 assert_eq!(output.len(), 0);

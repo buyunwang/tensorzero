@@ -61,6 +61,7 @@ async fn test_cache_write_and_read() {
         json_mode: ModelInferenceRequestJsonMode::Off,
         function_type: FunctionType::Chat,
         output_schema: None,
+        extra_body: None,
     };
     let model_provider_request = ModelProviderRequest {
         request: &model_inference_request,
@@ -71,7 +72,7 @@ async fn test_cache_write_and_read() {
     // Read (should be None)
     let result = cache_lookup(
         &clickhouse_connection_info,
-        model_provider_request.clone(),
+        model_provider_request,
         Some(max_age_s),
     )
     .await
@@ -81,7 +82,7 @@ async fn test_cache_write_and_read() {
     // Write
     start_cache_write(
         &clickhouse_connection_info,
-        model_provider_request.clone(),
+        model_provider_request,
         &["test content".to_string().into()],
         "raw request",
         "raw response",
@@ -92,7 +93,7 @@ async fn test_cache_write_and_read() {
     // Read (should be Some)
     let result = cache_lookup(
         &clickhouse_connection_info,
-        model_provider_request.clone(),
+        model_provider_request,
         Some(max_age_s),
     )
     .await
@@ -162,6 +163,7 @@ async fn test_cache_stream_write_and_read() {
         json_mode: ModelInferenceRequestJsonMode::Off,
         function_type: FunctionType::Chat,
         output_schema: None,
+        extra_body: None,
     };
     let model_provider_request = ModelProviderRequest {
         request: &model_inference_request,
@@ -172,7 +174,7 @@ async fn test_cache_stream_write_and_read() {
     // Read (should be None)
     let result = cache_lookup_streaming(
         &clickhouse_connection_info,
-        model_provider_request.clone(),
+        model_provider_request,
         Some(max_age_s),
     )
     .await
@@ -206,7 +208,7 @@ async fn test_cache_stream_write_and_read() {
     // Read (should be Some)
     let result = cache_lookup_streaming(
         &clickhouse_connection_info,
-        model_provider_request.clone(),
+        model_provider_request,
         Some(max_age_s),
     )
     .await
@@ -505,15 +507,15 @@ pub async fn check_test_streaming_cache_with_err(
         );
     }
 
-    let input_tokens = result.get("input_tokens").unwrap().as_u64().unwrap();
-    let output_tokens = result.get("output_tokens").unwrap().as_u64().unwrap();
+    let input_tokens = result.get("input_tokens").unwrap();
+    let output_tokens = result.get("output_tokens").unwrap();
 
     if expect_cached {
-        assert_eq!(input_tokens, 0);
-        assert_eq!(output_tokens, 0);
+        assert!(input_tokens.is_null());
+        assert!(output_tokens.is_null());
     } else {
-        assert_eq!(input_tokens, 10);
-        assert_eq!(output_tokens, 16);
+        assert_eq!(input_tokens.as_u64().unwrap(), 10);
+        assert_eq!(output_tokens.as_u64().unwrap(), 16);
     }
 
     let response_time_ms = result.get("response_time_ms").unwrap().as_u64().unwrap();

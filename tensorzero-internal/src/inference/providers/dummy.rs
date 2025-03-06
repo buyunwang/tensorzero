@@ -10,18 +10,20 @@ use uuid::Uuid;
 
 use super::provider_trait::InferenceProvider;
 
+use crate::cache::ModelProviderRequest;
 use crate::embeddings::{EmbeddingProvider, EmbeddingProviderResponse, EmbeddingRequest};
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::types::batch::PollBatchInferenceResponse;
 use crate::inference::types::batch::{BatchRequestRow, BatchStatus};
-use crate::inference::types::ProviderInferenceResponseStreamInner;
 use crate::inference::types::{
-    batch::StartBatchProviderInferenceResponse, current_timestamp, ContentBlock, ContentBlockChunk,
-    Latency, ModelInferenceRequest, PeekableProviderInferenceResponseStream,
+    batch::StartBatchProviderInferenceResponse, current_timestamp, ContentBlockChunk,
+    ContentBlockOutput, Latency, ModelInferenceRequest, PeekableProviderInferenceResponseStream,
     ProviderInferenceResponse, ProviderInferenceResponseChunk, Usage,
 };
-use crate::model::CredentialLocation;
+use crate::inference::types::{ContentBlock, ProviderInferenceResponseStreamInner};
+use crate::inference::types::{Text, TextChunk, Thought, ThoughtChunk};
+use crate::model::{CredentialLocation, ModelProvider};
 use crate::tool::{ToolCall, ToolCallChunk};
 
 const PROVIDER_NAME: &str = "Dummy";
@@ -118,6 +120,7 @@ pub static DUMMY_INFER_USAGE: Usage = Usage {
     input_tokens: 10,
     output_tokens: 10,
 };
+pub static DUMMY_STREAMING_THINKING: [&str; 2] = ["hmmm", "hmmm"];
 pub static DUMMY_STREAMING_RESPONSE: [&str; 16] = [
     "Wally,",
     " the",
@@ -144,18 +147,27 @@ pub static DUMMY_STREAMING_TOOL_RESPONSE: [&str; 5] = [
     r#""}"#,
 ];
 
+pub static DUMMY_STREAMING_JSON_RESPONSE: [&str; 5] =
+    [r#"{"name""#, r#":"John""#, r#","age""#, r#":30"#, r#"}"#];
+
 pub static DUMMY_RAW_REQUEST: &str = "raw request";
 
 impl InferenceProvider for DummyProvider {
     async fn infer<'a>(
         &'a self,
-        request: &'a ModelInferenceRequest<'_>,
+        ModelProviderRequest {
+            request,
+            provider_name: _,
+            model_name: _,
+        }: ModelProviderRequest<'a>,
         _http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
+        _model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
         if self.model_name == "slow" {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+
         // Check for flaky models
         if self.model_name.starts_with("flaky_") {
             #[allow(clippy::expect_used)]
@@ -210,13 +222,29 @@ impl InferenceProvider for DummyProvider {
         let id = Uuid::now_v7();
         let created = current_timestamp();
         let content = match self.model_name.as_str() {
-            "tool" => vec![ContentBlock::ToolCall(ToolCall {
+            "tool" => vec![ContentBlockOutput::ToolCall(ToolCall {
                 name: "get_temperature".to_string(),
                 #[allow(clippy::unwrap_used)]
                 arguments: serde_json::to_string(&*DUMMY_TOOL_RESPONSE).unwrap(),
                 id: "0".to_string(),
             })],
-            "bad_tool" => vec![ContentBlock::ToolCall(ToolCall {
+            "reasoner" => vec![
+                ContentBlockOutput::Thought(Thought {
+                    text: "hmmm".to_string(),
+                }),
+                ContentBlockOutput::Text(Text {
+                    text: DUMMY_INFER_RESPONSE_CONTENT.to_string(),
+                }),
+            ],
+            "json_reasoner" => vec![
+                ContentBlockOutput::Thought(Thought {
+                    text: "hmmm".to_string(),
+                }),
+                ContentBlockOutput::Text(Text {
+                    text: DUMMY_JSON_RESPONSE_RAW.to_string(),
+                }),
+            ],
+            "bad_tool" => vec![ContentBlockOutput::ToolCall(ToolCall {
                 name: "get_temperature".to_string(),
                 #[allow(clippy::unwrap_used)]
                 arguments: serde_json::to_string(&*DUMMY_BAD_TOOL_RESPONSE).unwrap(),
@@ -239,6 +267,28 @@ impl InferenceProvider for DummyProvider {
                 vec![r#"{"thinking": "hmmm", "answer_choice": 0}"#.to_string().into()]
             }
             "alternate" => vec![ALTERNATE_INFER_RESPONSE_CONTENT.to_string().into()],
+            "extract_images" => {
+                let images: Vec<_> = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| {
+                        m.content.iter().flat_map(|block| {
+                            if let ContentBlock::Image(image) = block {
+                                Some(image.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
+                vec![ContentBlockOutput::Text(Text {
+                    text: serde_json::to_string(&images).map_err(|e| {
+                        ErrorDetails::Serialization {
+                            message: format!("Failed to serialize collected images: {e:?}"),
+                        }
+                    })?,
+                })]
+            }
             _ => vec![DUMMY_INFER_RESPONSE_CONTENT.to_string().into()],
         };
         let raw_request = DUMMY_RAW_REQUEST.to_string();
@@ -256,7 +306,21 @@ impl InferenceProvider for DummyProvider {
             "best_of_n_big" => r#"{"thinking": "hmmm", "answer_choice": 100}"#.to_string(),
             _ => DUMMY_INFER_RESPONSE_RAW.to_string(),
         };
-        let usage = DUMMY_INFER_USAGE.clone();
+        let usage = match self.model_name.as_str() {
+            "input_tokens_zero" => Usage {
+                input_tokens: 0,
+                output_tokens: 10,
+            },
+            "output_tokens_zero" => Usage {
+                input_tokens: 10,
+                output_tokens: 0,
+            },
+            "input_tokens_output_tokens_zero" => Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            _ => DUMMY_INFER_USAGE.clone(),
+        };
         let latency = Latency::NonStreaming {
             response_time: Duration::from_millis(100),
         };
@@ -280,6 +344,7 @@ impl InferenceProvider for DummyProvider {
         _request: &'a ModelInferenceRequest<'_>,
         _http_client: &'a reqwest::Client,
         _dynamic_api_keys: &'a InferenceCredentials,
+        _model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
         if self.model_name == "slow" {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -308,6 +373,20 @@ impl InferenceProvider for DummyProvider {
                 .into());
             }
         }
+        if self.model_name == "reasoner" {
+            return create_streaming_reasoning_response(
+                DUMMY_STREAMING_THINKING.to_vec(),
+                DUMMY_STREAMING_RESPONSE.to_vec(),
+            )
+            .await;
+        }
+        if self.model_name == "json_reasoner" {
+            return create_streaming_reasoning_response(
+                DUMMY_STREAMING_THINKING.to_vec(),
+                DUMMY_STREAMING_JSON_RESPONSE.to_vec(),
+            )
+            .await;
+        }
 
         if self.model_name == "error" {
             return Err(ErrorDetails::InferenceClient {
@@ -324,10 +403,10 @@ impl InferenceProvider for DummyProvider {
 
         let created = current_timestamp();
 
-        let (content_chunks, is_tool_call) = if self.model_name == "tool" {
-            (DUMMY_STREAMING_TOOL_RESPONSE.to_vec(), true)
-        } else {
-            (DUMMY_STREAMING_RESPONSE.to_vec(), false)
+        let (content_chunks, is_tool_call) = match self.model_name.as_str() {
+            "tool" => (DUMMY_STREAMING_TOOL_RESPONSE.to_vec(), true),
+            "reasoner" => (DUMMY_STREAMING_RESPONSE.to_vec(), false),
+            _ => (DUMMY_STREAMING_RESPONSE.to_vec(), false),
         };
 
         let total_tokens = content_chunks.len() as u32;
@@ -458,4 +537,53 @@ impl EmbeddingProvider for DummyProvider {
             latency,
         })
     }
+}
+
+async fn create_streaming_reasoning_response(
+    thinking_chunks: Vec<&'static str>,
+    response_chunks: Vec<&'static str>,
+) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
+    let thinking_chunks = thinking_chunks.into_iter().map(|chunk| {
+        ContentBlockChunk::Thought(ThoughtChunk {
+            text: chunk.to_string(),
+            id: "0".to_string(),
+        })
+    });
+    let response_chunks = response_chunks.into_iter().map(|chunk| {
+        ContentBlockChunk::Text(TextChunk {
+            text: chunk.to_string(),
+            id: "0".to_string(),
+        })
+    });
+    let num_chunks = thinking_chunks.len() + response_chunks.len();
+    let created = current_timestamp();
+    let chained = thinking_chunks
+        .into_iter()
+        .chain(response_chunks.into_iter());
+    let stream = tokio_stream::iter(chained.enumerate())
+        .map(move |(i, chunk)| {
+            Ok(ProviderInferenceResponseChunk {
+                created,
+                content: vec![chunk],
+                usage: None,
+                raw_response: "".to_string(),
+                latency: Duration::from_millis(50 + 10 * (i as u64 + 1)),
+            })
+        })
+        .chain(tokio_stream::once(Ok(ProviderInferenceResponseChunk {
+            created,
+            content: vec![],
+            usage: Some(crate::inference::types::Usage {
+                input_tokens: 10,
+                output_tokens: 10,
+            }),
+            raw_response: "".to_string(),
+            latency: Duration::from_millis(50 + 10 * (num_chunks as u64)),
+        })))
+        .throttle(std::time::Duration::from_millis(10));
+
+    Ok((
+        futures::stream::StreamExt::peekable(Box::pin(stream)),
+        DUMMY_RAW_REQUEST.to_string(),
+    ))
 }

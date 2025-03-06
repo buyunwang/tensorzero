@@ -5,29 +5,36 @@ use reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::cache::ModelProviderRequest;
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::providers::provider_trait::InferenceProvider;
 use crate::inference::types::batch::BatchRequestRow;
 use crate::inference::types::batch::PollBatchInferenceResponse;
+use crate::inference::types::resolved_input::ImageWithPath;
 use crate::inference::types::{
     batch::StartBatchProviderInferenceResponse, ContentBlock, ContentBlockChunk, FunctionType,
     Latency, ModelInferenceRequestJsonMode, Role, Text,
 };
 use crate::inference::types::{
-    ModelInferenceRequest, PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
+    ContentBlockOutput, FlattenUnknown, ImageKind, ModelInferenceRequest,
+    PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
     ProviderInferenceResponseChunk, ProviderInferenceResponseStreamInner, RequestMessage,
     TextChunk, Usage,
 };
-use crate::model::{build_creds_caching_default, Credential, CredentialLocation};
+use crate::model::{
+    build_creds_caching_default, fully_qualified_name, Credential, CredentialLocation,
+    ModelProvider,
+};
 use crate::tool::{ToolCall, ToolCallChunk, ToolCallConfig, ToolChoice, ToolConfig};
 
-use super::helpers::peek_first_chunk;
+use super::helpers::{inject_extra_body, peek_first_chunk};
 
 lazy_static! {
     static ref ANTHROPIC_BASE_URL: Url = {
@@ -122,11 +129,24 @@ impl InferenceProvider for AnthropicProvider {
     /// Anthropic non-streaming API request
     async fn infer<'a>(
         &'a self,
-        request: &'a ModelInferenceRequest<'_>,
+        ModelProviderRequest {
+            request,
+            provider_name: _,
+            model_name: tensorzero_model_name,
+        }: ModelProviderRequest<'a>,
         http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = AnthropicRequestBody::new(&self.model_name, request)?;
+        let mut request_body =
+            serde_json::to_value(AnthropicRequestBody::new(&self.model_name, request)?).map_err(
+                |e| {
+                    Error::new(ErrorDetails::Serialization {
+                        message: format!("Error serializing Anthropic request: {e}"),
+                    })
+                },
+            )?;
+        inject_extra_body(request.extra_body, model_provider, &mut request_body)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
         let res = http_client
@@ -176,6 +196,8 @@ impl InferenceProvider for AnthropicProvider {
                 function_type: &request.function_type,
                 json_mode: &request.json_mode,
                 raw_response,
+                model_name: tensorzero_model_name,
+                provider_name: &model_provider.name,
             };
             Ok(response_with_latency.try_into()?)
         } else {
@@ -210,8 +232,17 @@ impl InferenceProvider for AnthropicProvider {
         request: &'a ModelInferenceRequest<'_>,
         http_client: &'a reqwest::Client,
         api_key: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = AnthropicRequestBody::new(&self.model_name, request)?;
+        let mut request_body =
+            serde_json::to_value(AnthropicRequestBody::new(&self.model_name, request)?).map_err(
+                |e| {
+                    Error::new(ErrorDetails::Serialization {
+                        message: format!("Error serializing Anthropic request: {e}"),
+                    })
+                },
+            )?;
+        inject_extra_body(request.extra_body, model_provider, &mut request_body)?;
         let raw_request = serde_json::to_string(&request_body).map_err(|e| {
             Error::new(ErrorDetails::Serialization {
                 message: format!("Error serializing request body as JSON: {e}"),
@@ -422,6 +453,9 @@ enum AnthropicMessageContent<'a> {
     Text {
         text: &'a str,
     },
+    Image {
+        source: AnthropicImageSource,
+    },
     ToolResult {
         tool_use_id: &'a str,
         content: Vec<AnthropicMessageContent<'a>>,
@@ -433,12 +467,28 @@ enum AnthropicMessageContent<'a> {
     },
 }
 
-impl<'a> TryFrom<&'a ContentBlock> for AnthropicMessageContent<'a> {
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct AnthropicImageSource {
+    r#type: AnthropicImageType,
+    media_type: ImageKind,
+    data: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AnthropicImageType {
+    Base64,
+}
+
+impl<'a> TryFrom<&'a ContentBlock> for Option<FlattenUnknown<'a, AnthropicMessageContent<'a>>> {
     type Error = Error;
 
     fn try_from(block: &'a ContentBlock) -> Result<Self, Self::Error> {
         match block {
-            ContentBlock::Text(Text { text }) => Ok(AnthropicMessageContent::Text { text }),
+            ContentBlock::Text(Text { text }) => Ok(Some(FlattenUnknown::Normal(
+                AnthropicMessageContent::Text { text },
+            ))),
             ContentBlock::ToolCall(tool_call) => {
                 // Convert the tool call arguments from String to JSON Value (Anthropic expects an object)
                 let input: Value = serde_json::from_str(&tool_call.arguments).map_err(|e| {
@@ -461,18 +511,44 @@ impl<'a> TryFrom<&'a ContentBlock> for AnthropicMessageContent<'a> {
                     }));
                 }
 
-                Ok(AnthropicMessageContent::ToolUse {
-                    id: &tool_call.id,
-                    name: &tool_call.name,
-                    input,
-                })
+                Ok(Some(FlattenUnknown::Normal(
+                    AnthropicMessageContent::ToolUse {
+                        id: &tool_call.id,
+                        name: &tool_call.name,
+                        input,
+                    },
+                )))
             }
-            ContentBlock::ToolResult(tool_result) => Ok(AnthropicMessageContent::ToolResult {
-                tool_use_id: &tool_result.id,
-                content: vec![AnthropicMessageContent::Text {
-                    text: &tool_result.result,
-                }],
-            }),
+            ContentBlock::ToolResult(tool_result) => Ok(Some(FlattenUnknown::Normal(
+                AnthropicMessageContent::ToolResult {
+                    tool_use_id: &tool_result.id,
+                    content: vec![AnthropicMessageContent::Text {
+                        text: &tool_result.result,
+                    }],
+                },
+            ))),
+            ContentBlock::Image(ImageWithPath {
+                image,
+                storage_path: _,
+            }) => Ok(Some(FlattenUnknown::Normal(
+                AnthropicMessageContent::Image {
+                    source: AnthropicImageSource {
+                        r#type: AnthropicImageType::Base64,
+                        media_type: image.mime_type,
+                        data: image.data()?.clone(),
+                    },
+                },
+            ))),
+            // We don't support thought blocks being passed in from a request.
+            // These are only possible to be passed in in the scenario where the
+            // output of a chat completion is used as an input to another model inference,
+            // i.e. a judge or something.
+            // We don't think the thoughts should be passed in in this case.
+            ContentBlock::Thought(_thought) => Ok(None),
+            ContentBlock::Unknown {
+                data,
+                model_provider_name: _,
+            } => Ok(Some(FlattenUnknown::Unknown(Cow::Borrowed(data)))),
         }
     }
 }
@@ -480,20 +556,22 @@ impl<'a> TryFrom<&'a ContentBlock> for AnthropicMessageContent<'a> {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct AnthropicMessage<'a> {
     role: AnthropicRole,
-    content: Vec<AnthropicMessageContent<'a>>,
+    content: Vec<FlattenUnknown<'a, AnthropicMessageContent<'a>>>,
 }
 
 impl<'a> TryFrom<&'a RequestMessage> for AnthropicMessage<'a> {
     type Error = Error;
-
     fn try_from(
         inference_message: &'a RequestMessage,
     ) -> Result<AnthropicMessage<'a>, Self::Error> {
-        let content: Vec<AnthropicMessageContent> = inference_message
+        let content: Vec<FlattenUnknown<AnthropicMessageContent>> = inference_message
             .content
             .iter()
             .map(|block| block.try_into())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<Option<FlattenUnknown<AnthropicMessageContent>>>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         Ok(AnthropicMessage {
             role: inference_message.role.into(),
@@ -603,9 +681,9 @@ fn prepare_messages(mut messages: Vec<AnthropicMessage>) -> Result<Vec<Anthropic
                 0,
                 AnthropicMessage {
                     role: AnthropicRole::User,
-                    content: vec![AnthropicMessageContent::Text {
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                         text: "[listening]",
-                    }],
+                    })],
                 },
             );
         }
@@ -618,9 +696,9 @@ fn prepare_messages(mut messages: Vec<AnthropicMessage>) -> Result<Vec<Anthropic
         if last_message.role == AnthropicRole::Assistant {
             messages.push(AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text {
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                     text: "[listening]",
-                }],
+                })],
             });
         }
     }
@@ -632,21 +710,21 @@ fn prefill_json_message(messages: Vec<AnthropicMessage>) -> Vec<AnthropicMessage
     // Add a JSON-prefill message for Anthropic's JSON mode
     messages.push(AnthropicMessage {
         role: AnthropicRole::Assistant,
-        content: vec![AnthropicMessageContent::Text {
+        content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
             text: "Here is the JSON requested:\n{",
-        }],
+        })],
     });
     messages
 }
 
 pub(crate) fn prefill_json_response(
-    content: Vec<ContentBlock>,
-) -> Result<Vec<ContentBlock>, Error> {
+    content: Vec<ContentBlockOutput>,
+) -> Result<Vec<ContentBlockOutput>, Error> {
     // Check if the content is a single text block
     if content.len() == 1 {
-        if let ContentBlock::Text(text) = &content[0] {
+        if let ContentBlockOutput::Text(text) = &content[0] {
             // If it's a single text block, add a "{" to the beginning
-            return Ok(vec![ContentBlock::Text(Text {
+            return Ok(vec![ContentBlockOutput::Text(Text {
                 text: format!("{{{}", text.text.trim()),
             })]);
         }
@@ -709,26 +787,31 @@ pub enum AnthropicContentBlock {
     },
 }
 
-impl TryFrom<AnthropicContentBlock> for ContentBlock {
-    type Error = Error;
-    fn try_from(block: AnthropicContentBlock) -> Result<Self, Self::Error> {
-        match block {
-            AnthropicContentBlock::Text { text } => Ok(text.into()),
-            AnthropicContentBlock::ToolUse { id, name, input } => {
-                Ok(ContentBlock::ToolCall(ToolCall {
-                    id,
-                    name,
-                    arguments: serde_json::to_string(&input).map_err(|e| {
-                        Error::new(ErrorDetails::InferenceServer {
-                            message: format!("Error parsing input for tool call: {e}"),
-                            provider_type: PROVIDER_TYPE.to_string(),
-                            raw_request: None,
-                            raw_response: Some(serde_json::to_string(&input).unwrap_or_default()),
-                        })
-                    })?,
-                }))
-            }
+fn convert_to_output(
+    model_name: &str,
+    provider_name: &str,
+    block: FlattenUnknown<'static, AnthropicContentBlock>,
+) -> Result<ContentBlockOutput, Error> {
+    match block {
+        FlattenUnknown::Normal(AnthropicContentBlock::Text { text }) => Ok(text.into()),
+        FlattenUnknown::Normal(AnthropicContentBlock::ToolUse { id, name, input }) => {
+            Ok(ContentBlockOutput::ToolCall(ToolCall {
+                id,
+                name,
+                arguments: serde_json::to_string(&input).map_err(|e| {
+                    Error::new(ErrorDetails::InferenceServer {
+                        message: format!("Error parsing input for tool call: {e}"),
+                        provider_type: PROVIDER_TYPE.to_string(),
+                        raw_request: None,
+                        raw_response: Some(serde_json::to_string(&input).unwrap_or_default()),
+                    })
+                })?,
+            }))
         }
+        FlattenUnknown::Unknown(data) => Ok(ContentBlockOutput::Unknown {
+            data: data.into_owned(),
+            model_provider_name: Some(fully_qualified_name(model_name, provider_name)),
+        }),
     }
 }
 
@@ -752,7 +835,7 @@ struct AnthropicResponse {
     id: String,
     r#type: String, // this is always "message"
     role: String,   // this is always "assistant"
-    content: Vec<AnthropicContentBlock>,
+    content: Vec<FlattenUnknown<'static, AnthropicContentBlock>>,
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_reason: Option<String>,
@@ -766,10 +849,12 @@ struct AnthropicResponseWithMetadata<'a> {
     response: AnthropicResponse,
     raw_response: String,
     latency: Latency,
-    request: AnthropicRequestBody<'a>,
+    request: serde_json::Value,
     input_messages: Vec<RequestMessage>,
     function_type: &'a FunctionType,
     json_mode: &'a ModelInferenceRequestJsonMode,
+    model_name: &'a str,
+    provider_name: &'a str,
 }
 
 impl<'a> TryFrom<AnthropicResponseWithMetadata<'a>> for ProviderInferenceResponse {
@@ -783,6 +868,8 @@ impl<'a> TryFrom<AnthropicResponseWithMetadata<'a>> for ProviderInferenceRespons
             input_messages,
             function_type,
             json_mode,
+            model_name,
+            provider_name,
         } = value;
 
         let raw_request = serde_json::to_string(&request_body).map_err(|e| {
@@ -791,10 +878,10 @@ impl<'a> TryFrom<AnthropicResponseWithMetadata<'a>> for ProviderInferenceRespons
             })
         })?;
 
-        let output: Vec<ContentBlock> = response
+        let output: Vec<ContentBlockOutput> = response
             .content
             .into_iter()
-            .map(|block| block.try_into())
+            .map(|block| convert_to_output(model_name, provider_name, block))
             .collect::<Result<Vec<_>, _>>()?;
         let content = if matches!(
             json_mode,
@@ -808,7 +895,10 @@ impl<'a> TryFrom<AnthropicResponseWithMetadata<'a>> for ProviderInferenceRespons
 
         Ok(ProviderInferenceResponse::new(
             content,
-            request_body.system.map(String::from),
+            request_body
+                .get("system")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_owned()),
             input_messages,
             raw_request,
             raw_response,
@@ -1027,7 +1117,7 @@ fn anthropic_to_tensorzero_stream_message(
                 Ok(None)
             }
         }
-        AnthropicStreamMessage::MessageStop | AnthropicStreamMessage::Ping {} => Ok(None),
+        AnthropicStreamMessage::MessageStop | AnthropicStreamMessage::Ping => Ok(None),
     }
 }
 
@@ -1147,12 +1237,14 @@ mod tests {
 
     #[test]
     fn test_try_from_content_block() {
-        let text_content_block = "test".to_string().into();
+        let text_content_block: ContentBlock = "test".to_string().into();
         let anthropic_content_block =
-            AnthropicMessageContent::try_from(&text_content_block).unwrap();
+            Option::<FlattenUnknown<AnthropicMessageContent>>::try_from(&text_content_block)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             anthropic_content_block,
-            AnthropicMessageContent::Text { text: "test" }
+            FlattenUnknown::Normal(AnthropicMessageContent::Text { text: "test" })
         );
 
         let tool_call_content_block = ContentBlock::ToolCall(ToolCall {
@@ -1161,14 +1253,16 @@ mod tests {
             arguments: serde_json::to_string(&json!({"type": "string"})).unwrap(),
         });
         let anthropic_content_block =
-            AnthropicMessageContent::try_from(&tool_call_content_block).unwrap();
+            Option::<FlattenUnknown<AnthropicMessageContent>>::try_from(&tool_call_content_block)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             anthropic_content_block,
-            AnthropicMessageContent::ToolUse {
+            FlattenUnknown::Normal(AnthropicMessageContent::ToolUse {
                 id: "test_id",
                 name: "test_name",
                 input: json!({"type": "string"})
-            }
+            })
         );
     }
 
@@ -1184,7 +1278,9 @@ mod tests {
             anthropic_message,
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text { text: "test" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "test"
+                })],
             }
         );
 
@@ -1198,9 +1294,9 @@ mod tests {
             anthropic_message,
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text {
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                     text: "test_assistant",
-                }],
+                })],
             }
         );
 
@@ -1218,12 +1314,14 @@ mod tests {
             anthropic_message,
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::ToolResult {
-                    tool_use_id: "test_tool_call_id",
-                    content: vec![AnthropicMessageContent::Text {
-                        text: "test_tool_response"
-                    }],
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    AnthropicMessageContent::ToolResult {
+                        tool_use_id: "test_tool_call_id",
+                        content: vec![AnthropicMessageContent::Text {
+                            text: "test_tool_response"
+                        }],
+                    }
+                )],
             }
         );
     }
@@ -1233,9 +1331,9 @@ mod tests {
         let model = "claude".to_string();
         let listening_message = AnthropicMessage {
             role: AnthropicRole::User,
-            content: vec![AnthropicMessageContent::Text {
+            content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                 text: "[listening]",
-            }],
+            })],
         };
 
         // Test Case 1: Empty message list
@@ -1254,6 +1352,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = AnthropicRequestBody::new(&model, &inference_request);
         let details = anthropic_request_body.unwrap_err().get_owned_details();
@@ -1284,6 +1383,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = AnthropicRequestBody::new(&model, &inference_request);
         assert!(anthropic_request_body.is_ok());
@@ -1332,6 +1432,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = AnthropicRequestBody::new(&model, &inference_request);
         assert!(anthropic_request_body.is_ok());
@@ -1384,6 +1485,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = AnthropicRequestBody::new(&model, &inference_request);
         assert!(anthropic_request_body.is_ok());
@@ -1436,6 +1538,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::On,
             function_type: FunctionType::Json,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = AnthropicRequestBody::new(&model, &inference_request);
         assert!(anthropic_request_body.is_ok());
@@ -1454,9 +1557,9 @@ mod tests {
             result.messages[3],
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text {
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                     text: "Here is the JSON requested:\n{",
-                }],
+                })],
             }
         );
     }
@@ -1465,9 +1568,9 @@ mod tests {
     fn test_prepare_messages() {
         let listening_message = AnthropicMessage {
             role: AnthropicRole::User,
-            content: vec![AnthropicMessageContent::Text {
+            content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                 text: "[listening]",
-            }],
+            })],
         };
 
         // Test case 1: Empty messages - should add listening message
@@ -1479,11 +1582,15 @@ mod tests {
         let messages = vec![
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hi",
+                })],
             },
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hello",
+                })],
             },
         ];
         let result = prepare_messages(messages).unwrap();
@@ -1493,11 +1600,15 @@ mod tests {
                 listening_message.clone(),
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
-                    content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hi"
+                    })],
                 },
                 AnthropicMessage {
                     role: AnthropicRole::User,
-                    content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hello"
+                    })],
                 },
             ]
         );
@@ -1506,11 +1617,15 @@ mod tests {
         let messages = vec![
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hello",
+                })],
             },
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hi",
+                })],
             },
         ];
         let result = prepare_messages(messages).unwrap();
@@ -1519,11 +1634,15 @@ mod tests {
             vec![
                 AnthropicMessage {
                     role: AnthropicRole::User,
-                    content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hello"
+                    })],
                 },
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
-                    content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hi"
+                    })],
                 },
                 listening_message.clone(),
             ]
@@ -1533,17 +1652,21 @@ mod tests {
         let messages = vec![
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hello",
+                })],
             },
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hi",
+                })],
             },
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text {
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                     text: "How are you?",
-                }],
+                })],
             },
         ];
         let result = prepare_messages(messages.clone()).unwrap();
@@ -1553,17 +1676,21 @@ mod tests {
         let messages = vec![
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hi",
+                })],
             },
             AnthropicMessage {
                 role: AnthropicRole::User,
-                content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                    text: "Hello",
+                })],
             },
             AnthropicMessage {
                 role: AnthropicRole::Assistant,
-                content: vec![AnthropicMessageContent::Text {
+                content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                     text: "How can I help?",
-                }],
+                })],
             },
         ];
         let result = prepare_messages(messages).unwrap();
@@ -1573,17 +1700,21 @@ mod tests {
                 listening_message.clone(),
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
-                    content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hi"
+                    })],
                 },
                 AnthropicMessage {
                     role: AnthropicRole::User,
-                    content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hello"
+                    })],
                 },
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
-                    content: vec![AnthropicMessageContent::Text {
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                         text: "How can I help?"
-                    }],
+                    })],
                 },
                 listening_message.clone(),
             ]
@@ -1592,7 +1723,9 @@ mod tests {
         // Test case 6: Single Assistant message - should add listening messages at both ends
         let messages = vec![AnthropicMessage {
             role: AnthropicRole::Assistant,
-            content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+            content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                text: "Hi",
+            })],
         }];
         let result = prepare_messages(messages).unwrap();
         assert_eq!(
@@ -1601,7 +1734,9 @@ mod tests {
                 listening_message.clone(),
                 AnthropicMessage {
                     role: AnthropicRole::Assistant,
-                    content: vec![AnthropicMessageContent::Text { text: "Hi" }],
+                    content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                        text: "Hi"
+                    })],
                 },
                 listening_message.clone(),
             ]
@@ -1610,7 +1745,9 @@ mod tests {
         // Test case 7: Single User message - no changes needed
         let messages = vec![AnthropicMessage {
             role: AnthropicRole::User,
-            content: vec![AnthropicMessageContent::Text { text: "Hello" }],
+            content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
+                text: "Hello",
+            })],
         }];
         let result = prepare_messages(messages.clone()).unwrap();
         assert_eq!(result, messages);
@@ -1712,9 +1849,9 @@ mod tests {
             id: "1".to_string(),
             r#type: "message".to_string(),
             role: "assistant".to_string(),
-            content: vec![AnthropicContentBlock::Text {
+            content: vec![FlattenUnknown::Normal(AnthropicContentBlock::Text {
                 text: "Response text".to_string(),
-            }],
+            })],
             model: "model-name".into(),
             stop_reason: Some("stop reason".to_string()),
             stop_sequence: Some("stop sequence".to_string()),
@@ -1732,7 +1869,7 @@ mod tests {
             max_tokens: 100,
             stream: Some(false),
             system: None,
-            top_p: Some(0.9),
+            top_p: Some(0.5),
             temperature: None,
             tool_choice: None,
             tools: None,
@@ -1747,10 +1884,12 @@ mod tests {
             response: anthropic_response_body.clone(),
             raw_response: raw_response.clone(),
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             input_messages: input_messages.clone(),
             function_type: &FunctionType::Chat,
             json_mode: &ModelInferenceRequestJsonMode::Off,
+            model_name: "model-name",
+            provider_name: "dummy",
         };
 
         let inference_response = ProviderInferenceResponse::try_from(body_with_latency).unwrap();
@@ -1771,11 +1910,11 @@ mod tests {
             id: "2".to_string(),
             r#type: "message".to_string(),
             role: "assistant".to_string(),
-            content: vec![AnthropicContentBlock::ToolUse {
+            content: vec![FlattenUnknown::Normal(AnthropicContentBlock::ToolUse {
                 id: "tool_call_1".to_string(),
                 name: "get_temperature".to_string(),
                 input: json!({"location": "New York"}),
-            }],
+            })],
             model: "model-name".into(),
             stop_reason: Some("tool_call".to_string()),
             stop_sequence: None,
@@ -1791,7 +1930,7 @@ mod tests {
             stream: Some(false),
             system: None,
             temperature: None,
-            top_p: Some(0.9),
+            top_p: Some(0.5),
             tool_choice: None,
             tools: None,
         };
@@ -1804,17 +1943,19 @@ mod tests {
             response: anthropic_response_body.clone(),
             raw_response: raw_response.clone(),
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             input_messages: input_messages.clone(),
             function_type: &FunctionType::Chat,
             json_mode: &ModelInferenceRequestJsonMode::Off,
+            model_name: "model-name",
+            provider_name: "dummy",
         };
 
         let inference_response: ProviderInferenceResponse = body_with_latency.try_into().unwrap();
         assert!(inference_response.output.len() == 1);
         assert_eq!(
             inference_response.output[0],
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 id: "tool_call_1".to_string(),
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location":"New York"}"#.to_string(),
@@ -1834,14 +1975,14 @@ mod tests {
             r#type: "message".to_string(),
             role: "assistant".to_string(),
             content: vec![
-                AnthropicContentBlock::Text {
+                FlattenUnknown::Normal(AnthropicContentBlock::Text {
                     text: "Here's the weather:".to_string(),
-                },
-                AnthropicContentBlock::ToolUse {
+                }),
+                FlattenUnknown::Normal(AnthropicContentBlock::ToolUse {
                     id: "tool_call_2".to_string(),
                     name: "get_temperature".to_string(),
                     input: json!({"location": "London"}),
-                },
+                }),
             ],
             model: "model-name".into(),
             stop_reason: None,
@@ -1858,7 +1999,7 @@ mod tests {
             stream: Some(false),
             system: None,
             temperature: None,
-            top_p: Some(0.9),
+            top_p: Some(0.5),
             tool_choice: None,
             tools: None,
         };
@@ -1871,10 +2012,12 @@ mod tests {
             response: anthropic_response_body.clone(),
             raw_response: raw_response.clone(),
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             input_messages: input_messages.clone(),
             function_type: &FunctionType::Chat,
             json_mode: &ModelInferenceRequestJsonMode::Off,
+            model_name: "model-name",
+            provider_name: "dummy",
         };
         let inference_response = ProviderInferenceResponse::try_from(body_with_latency).unwrap();
         assert_eq!(
@@ -1884,7 +2027,7 @@ mod tests {
         assert!(inference_response.output.len() == 2);
         assert_eq!(
             inference_response.output[1],
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 id: "tool_call_2".to_string(),
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location":"London"}"#.to_string(),
@@ -2223,9 +2366,9 @@ mod tests {
         // Create a sample input message
         let input_messages = vec![AnthropicMessage {
             role: AnthropicRole::User,
-            content: vec![AnthropicMessageContent::Text {
+            content: vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                 text: "Generate some JSON",
-            }],
+            })],
         }];
 
         // Call the function
@@ -2238,42 +2381,42 @@ mod tests {
         assert_eq!(result[0].role, AnthropicRole::User);
         assert_eq!(
             result[0].content,
-            vec![AnthropicMessageContent::Text {
+            vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                 text: "Generate some JSON",
-            }]
+            })]
         );
 
         // Check the new message is correct
         assert_eq!(result[1].role, AnthropicRole::Assistant);
         assert_eq!(
             result[1].content,
-            vec![AnthropicMessageContent::Text {
+            vec![FlattenUnknown::Normal(AnthropicMessageContent::Text {
                 text: "Here is the JSON requested:\n{",
-            }]
+            })]
         );
     }
 
     #[test]
     fn test_prefill_json_response() {
         // Test case 1: Single text block
-        let input = vec![ContentBlock::Text(Text {
+        let input = vec![ContentBlockOutput::Text(Text {
             text: "  \"key\": \"value\"}".to_string(),
         })];
         let result = prefill_json_response(input).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
-            ContentBlock::Text(Text {
+            ContentBlockOutput::Text(Text {
                 text: "{\"key\": \"value\"}".to_string(),
             })
         );
 
         // Test case 2: Multiple blocks
         let input = vec![
-            ContentBlock::Text(Text {
+            ContentBlockOutput::Text(Text {
                 text: "Block 1".to_string(),
             }),
-            ContentBlock::Text(Text {
+            ContentBlockOutput::Text(Text {
                 text: "Block 2".to_string(),
             }),
         ];
@@ -2286,7 +2429,7 @@ mod tests {
         assert_eq!(result, input);
 
         // Test case 4: Non-text block
-        let input = vec![ContentBlock::ToolCall(ToolCall {
+        let input = vec![ContentBlockOutput::ToolCall(ToolCall {
             id: "1".to_string(),
             name: "test_tool".to_string(),
             arguments: "{}".to_string(),

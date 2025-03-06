@@ -3,6 +3,7 @@ use crate::clickhouse_migration_manager::migration_trait::Migration;
 use crate::error::{Error, ErrorDetails};
 
 use super::check_table_exists;
+use async_trait::async_trait;
 
 /// This migration adds additional columns to the `ModelInference` table
 /// The goal of this is to improve observability of each model inference at an intermediate level of granularity.
@@ -17,17 +18,11 @@ pub struct Migration0004<'a> {
     pub clickhouse: &'a ClickHouseConnectionInfo,
 }
 
+#[async_trait]
 impl Migration for Migration0004<'_> {
-    /// Check if you can connect to the database and if the ModelInference table exists
+    /// Check if the ModelInference table exists
     /// If all of this is OK, then we can apply the migration
     async fn can_apply(&self) -> Result<(), Error> {
-        self.clickhouse.health().await.map_err(|e| {
-            Error::new(ErrorDetails::ClickHouseMigration {
-                id: "0004".to_string(),
-                message: e.to_string(),
-            })
-        })?;
-
         if !check_table_exists(self.clickhouse, "ModelInference", "0004").await? {
             return Err(ErrorDetails::ClickHouseMigration {
                 id: "0004".to_string(),

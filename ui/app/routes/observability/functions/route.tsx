@@ -3,6 +3,11 @@ import { isRouteErrorResponse } from "react-router";
 import FunctionsTable from "./FunctionsTable";
 import { useConfig } from "~/context/config";
 import { countInferencesByFunction } from "~/utils/clickhouse/inference";
+import {
+  PageHeader,
+  PageLayout,
+  SectionLayout,
+} from "~/components/layout/PageLayout";
 
 export async function loader() {
   const countsInfo = await countInferencesByFunction();
@@ -12,11 +17,16 @@ export async function loader() {
 export default function FunctionsPage({ loaderData }: Route.ComponentProps) {
   const { countsInfo } = loaderData;
   const functions = useConfig().functions;
+  const totalFunctions = Object.keys(functions).length;
+
   return (
-    <div className="container mx-auto px-4 py-8">
-      <h2 className="mb-4 text-2xl font-semibold">Functions</h2>
-      <div className="mb-6 h-px w-full bg-gray-200"></div>
-      <FunctionsTable functions={functions} countsInfo={countsInfo} />
+    <div className="container mx-auto px-4 pb-8">
+      <PageLayout>
+        <PageHeader heading="Functions" count={totalFunctions} />
+        <SectionLayout>
+          <FunctionsTable functions={functions} countsInfo={countsInfo} />
+        </SectionLayout>
+      </PageLayout>
     </div>
   );
 }

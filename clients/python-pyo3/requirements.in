@@ -1,6 +1,0 @@
-pytest
-pytest-asyncio
-maturin
-uuid_utils
-httpx
-mypy

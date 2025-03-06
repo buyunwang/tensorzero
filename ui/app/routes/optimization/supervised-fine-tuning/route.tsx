@@ -17,6 +17,11 @@ import type { Route } from "./+types/route";
 import FineTuningStatus from "./FineTuningStatus";
 import { SFTResult } from "./SFTResult";
 import { SFTForm } from "./SFTForm";
+import {
+  PageHeader,
+  PageLayout,
+  SectionLayout,
+} from "~/components/layout/PageLayout";
 
 export const meta: MetaFunction = () => {
   return [
@@ -94,7 +99,16 @@ export default function SupervisedFineTuning({
   const config = useConfig();
   if (loaderData.status === "error") {
     return (
-      <div className="text-sm text-red-500">Error: {loaderData.error}</div>
+      <div className="container mx-auto px-4 pb-8">
+        <PageLayout>
+          <PageHeader heading="Supervised Fine-Tuning" />
+          <SectionLayout>
+            <div className="text-sm text-red-500">
+              Error: {loaderData.error}
+            </div>
+          </SectionLayout>
+        </PageLayout>
+      </div>
     );
   }
   const status = loaderData;
@@ -126,21 +140,22 @@ export default function SupervisedFineTuning({
   }
 
   return (
-    <div className="container mx-auto px-4 py-8">
-      <main>
-        <h2 className="mb-4 text-2xl font-semibold">Supervised Fine-Tuning</h2>
-        <div className="mb-6 h-px w-full bg-gray-200"></div>
-        {status.status === "idle" && (
-          <SFTForm
-            config={config}
-            submissionPhase={submissionPhase}
-            setSubmissionPhase={setSubmissionPhase}
-          />
-        )}
+    <div className="container mx-auto px-4 pb-8">
+      <PageLayout>
+        <PageHeader heading="Supervised Fine-Tuning" />
+        <SectionLayout>
+          {status.status === "idle" && (
+            <SFTForm
+              config={config}
+              submissionPhase={submissionPhase}
+              setSubmissionPhase={setSubmissionPhase}
+            />
+          )}
 
-        {<FineTuningStatus status={status} />}
-        <SFTResult finalResult={finalResult} />
-      </main>
+          {<FineTuningStatus status={status} />}
+          <SFTResult finalResult={finalResult} />
+        </SectionLayout>
+      </PageLayout>
     </div>
   );
 }

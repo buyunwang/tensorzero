@@ -3,6 +3,11 @@ repos:
     rev: v4.6.0
     hooks:
       - id: check-added-large-files
+        exclude: |
+          (?x)^(
+              examples/data-extraction-ner/data/clickhouse/fixture\.zip$|
+              examples/haiku-hidden-preferences/data/clickhouse/fixture\.zip$
+          )$
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-json
@@ -13,13 +18,33 @@ repos:
       - id: check-xml
       - id: check-yaml
       - id: detect-private-key
-        exclude: ^tensorzero-internal/src/inference/providers/gcp_vertex_gemini\.rs$
+        exclude: |
+          (?x)^(
+              tensorzero-internal/src/inference/providers/gcp_vertex_gemini\.rs|
+              ci/dummy-gcp-credentials\.json
+          )$
       - id: end-of-file-fixer
         exclude: \.minijinja$
       - id: trailing-whitespace
 
   - repo: local
     hooks:
+      # Find every pyproject.toml and generate a uv.lock file
+      - id: uv-lock
+        name: uv lock
+        entry: bash -c 'git ls-files "*.toml" "**/pyproject.toml" | grep -E "pyproject\.toml$" | while read f; do dir=$(dirname "$f"); echo "Locking $f"; uv lock --project="$f" && git add --intent-to-add "$dir/uv.lock"; done'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      # Find every pyproject.toml and generate a requirements.txt file
+      - id: uv-export
+        name: uv export
+        entry: bash -c 'git ls-files "*.toml" "**/pyproject.toml" | grep -E "pyproject\.toml$" | while read f; do dir=$(dirname "$f"); echo "Exporting $f"; uv export --project="$f" --output-file="$dir/requirements.txt" --quiet && git add --intent-to-add "$dir/requirements.txt"; done'
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: cargo-deny
         name: cargo deny
         entry: cargo deny check bans
@@ -94,13 +119,14 @@ repos:
       - id: ruff
         args: ["--extend-select", "I", "--fix"]
       - id: ruff-format
+
   - repo: https://github.com/RobertCraigie/pyright-python
     rev: v1.1.391
     hooks:
       - id: pyright
-        name: "pyright: clients/python"
-        files: ^clients/python/
-        args: ["--project", "clients/python/pyproject.toml"]
+        name: "pyright: clients/python-deprecated"
+        files: ^clients/python-deprecated/
+        args: ["--project", "clients/python-deprecated/pyproject.toml"]
         additional_dependencies:
           - httpx
           - uuid_utils
@@ -111,3 +137,14 @@ repos:
         args: ["--project", "clients/openai-python/pyrightconfig.json"]
         additional_dependencies:
           - openai
+
+      - id: pyright
+        name: "pyright: recipes"
+        files: ^recipes/
+        args: ["--project", "recipes/pyrightconfig.json"]
+        additional_dependencies:
+          - clickhouse-connect
+          - pandas
+          - pandas-stubs
+          - tensorzero
+          - tiktoken

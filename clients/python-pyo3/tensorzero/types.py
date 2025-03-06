@@ -50,6 +50,25 @@ class RawText:
 
 
 @dataclass
+class ImageBase64:
+    # This class does not subclass ContentBlock since it cannot be output by the API.
+    data: str
+    mime_type: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(type="image", data=self.data, mime_type=self.mime_type)
+
+
+@dataclass
+class ImageUrl:
+    # This class does not subclass ContentBlock since it cannot be output by the API.
+    url: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(type="image", url=self.url)
+
+
+@dataclass
 class ToolCall(ContentBlock):
     arguments: Optional[Dict[str, Any]]
     id: str
@@ -64,6 +83,14 @@ class ToolCall(ContentBlock):
             id=self.id,
             name=self.raw_name,
         )
+
+
+@dataclass
+class Thought(ContentBlock):
+    text: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(type="thought", value=self.text)
 
 
 @dataclass
@@ -149,6 +176,8 @@ def parse_content_block(block: Dict[str, Any]) -> ContentBlock:
             raw_name=block["raw_name"],
             type=block_type,
         )
+    elif block_type == "thought":
+        return Thought(text=block["text"], type=block_type)
     else:
         raise ValueError(f"Unknown content block type: {block}")
 
@@ -176,6 +205,12 @@ class ToolCallChunk(ContentBlockChunk):
     # `raw_arguments` will come as partial JSON
     raw_arguments: str
     raw_name: str
+
+
+@dataclass
+class ThoughtChunk(ContentBlockChunk):
+    text: str
+    id: str
 
 
 @dataclass
@@ -231,6 +266,8 @@ def parse_content_block_chunk(block: Dict[str, Any]) -> ContentBlockChunk:
             raw_name=block["raw_name"],
             type=block_type,
         )
+    elif block_type == "thought":
+        return ThoughtChunk(id=block["id"], text=block["text"], type=block_type)
     else:
         raise ValueError(f"Unknown content block type: {block}")
 

@@ -5,7 +5,7 @@ use crate::clickhouse::ClickHouseConnectionInfo;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::types::batch::deserialize_json_string;
 use crate::inference::types::{
-    ContentBlock, ContentBlockChunk, ModelInferenceRequest, ModelInferenceResponse,
+    ContentBlockChunk, ContentBlockOutput, ModelInferenceRequest, ModelInferenceResponse,
     ProviderInferenceResponseChunk,
 };
 use crate::model::StreamResponse;
@@ -64,7 +64,7 @@ pub struct CacheOptions {
     pub enabled: CacheEnabledMode,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ModelProviderRequest<'request> {
     pub request: &'request ModelInferenceRequest<'request>,
     pub model_name: &'request str,
@@ -160,7 +160,7 @@ impl CacheOutput for NonStreamingCacheData {}
 #[serde(transparent)]
 pub struct NonStreamingCacheData {
     #[serde(deserialize_with = "deserialize_json_string")]
-    pub blocks: Vec<ContentBlock>,
+    pub blocks: Vec<ContentBlockOutput>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -174,7 +174,7 @@ pub struct StreamingCacheData {
 pub fn start_cache_write(
     clickhouse_client: &ClickHouseConnectionInfo,
     request: ModelProviderRequest<'_>,
-    output: &[ContentBlock],
+    output: &[ContentBlockOutput],
     raw_request: &str,
     raw_response: &str,
 ) -> Result<(), Error> {
@@ -370,6 +370,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let model_provider_request = ModelProviderRequest {
             request: &model_inference_request,
@@ -392,6 +393,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let model_provider_request = ModelProviderRequest {
             request: &model_inference_request,
@@ -416,6 +418,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let model_provider_request = ModelProviderRequest {
             request: &streaming_model_inference_request,

@@ -8,7 +8,7 @@ pub fn setup_logs(debug: bool) {
     let default_level = if debug { "debug,warn" } else { "warn" };
     // Get the current log level from the environment variable `RUST_LOG`
     let log_level = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        format!("gateway={default_level},tensorzero_internal={default_level}").into()
+        format!("warn,gateway={default_level},tensorzero_internal={default_level}").into()
     });
 
     tracing_subscriber::registry()
@@ -16,9 +16,7 @@ pub fn setup_logs(debug: bool) {
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
-                .flatten_event(true)
-                .with_current_span(false)
-                .with_target(false),
+                .with_current_span(false),
         )
         .init();
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
 
+use crate::cache::ModelProviderRequest;
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::providers::provider_trait::InferenceProvider;
@@ -19,15 +21,17 @@ use crate::inference::types::{
     Latency, ModelInferenceRequestJsonMode, Role, Text, TextChunk,
 };
 use crate::inference::types::{
-    ModelInferenceRequest, PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
+    ContentBlockOutput, FlattenUnknown, ModelInferenceRequest,
+    PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
     ProviderInferenceResponseChunk, ProviderInferenceResponseStreamInner, RequestMessage, Usage,
 };
+use crate::model::ModelProvider;
 use crate::model::{build_creds_caching_default_with_fn, CredentialLocation};
 use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
 
 use super::anthropic::{prefill_json_chunk_response, prefill_json_response};
 use super::gcp_vertex_gemini::{default_api_key_location, GCPVertexCredentials};
-use super::helpers::peek_first_chunk;
+use super::helpers::{inject_extra_body, peek_first_chunk};
 
 /// Implements a subset of the GCP Vertex Gemini API as documented [here](https://cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.publishers.models/generateContent) for non-streaming
 /// and [here](https://cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.publishers.models/streamGenerateContent) for streaming
@@ -78,11 +82,22 @@ impl InferenceProvider for GCPVertexAnthropicProvider {
     /// Anthropic non-streaming API request
     async fn infer<'a>(
         &'a self,
-        request: &'a ModelInferenceRequest<'_>,
+        ModelProviderRequest {
+            request,
+            provider_name: _,
+            model_name: _,
+        }: ModelProviderRequest<'a>,
         http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = GCPVertexAnthropicRequestBody::new(request)?;
+        let mut request_body = serde_json::to_value(GCPVertexAnthropicRequestBody::new(request)?)
+            .map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!("Error serializing GCP Vertex Anthropic request: {e}"),
+            })
+        })?;
+        inject_extra_body(request.extra_body, model_provider, &mut request_body)?;
         let api_key = self
             .credentials
             .get_api_key(&self.audience, dynamic_api_keys)?;
@@ -138,7 +153,7 @@ impl InferenceProvider for GCPVertexAnthropicProvider {
             let response_code = res.status();
             let error_body = res.json::<GCPVertexAnthropicError>().await.map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
-                    message: format!("Error parsing response: {e}"),
+                    message: format!("Error parsing response: {e:?}"),
                     provider_type: PROVIDER_TYPE.to_string(),
                     raw_request: Some(serde_json::to_string(&request_body).unwrap_or_default()),
                     raw_response: None,
@@ -154,8 +169,15 @@ impl InferenceProvider for GCPVertexAnthropicProvider {
         request: &'a ModelInferenceRequest<'_>,
         http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = GCPVertexAnthropicRequestBody::new(request)?;
+        let mut request_body = serde_json::to_value(GCPVertexAnthropicRequestBody::new(request)?)
+            .map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!("Error serializing GCP Vertex Anthropic request: {e}"),
+            })
+        })?;
+        inject_extra_body(request.extra_body, model_provider, &mut request_body)?;
         let raw_request = serde_json::to_string(&request_body).map_err(|e| {
             Error::new(ErrorDetails::Serialization {
                 message: format!("Error serializing request body as JSON: {e}"),
@@ -363,14 +385,16 @@ enum GCPVertexAnthropicMessageContent<'a> {
     },
 }
 
-impl<'a> TryFrom<&'a ContentBlock> for GCPVertexAnthropicMessageContent<'a> {
+impl<'a> TryFrom<&'a ContentBlock>
+    for Option<FlattenUnknown<'a, GCPVertexAnthropicMessageContent<'a>>>
+{
     type Error = Error;
 
     fn try_from(block: &'a ContentBlock) -> Result<Self, Self::Error> {
         match block {
-            ContentBlock::Text(Text { text }) => {
-                Ok(GCPVertexAnthropicMessageContent::Text { text })
-            }
+            ContentBlock::Text(Text { text }) => Ok(Some(FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text { text },
+            ))),
             ContentBlock::ToolCall(tool_call) => {
                 // Convert the tool call arguments from String to JSON Value (Anthropic expects an object)
                 let input: Value = serde_json::from_str(&tool_call.arguments).map_err(|e| {
@@ -394,20 +418,36 @@ impl<'a> TryFrom<&'a ContentBlock> for GCPVertexAnthropicMessageContent<'a> {
                     .into());
                 }
 
-                Ok(GCPVertexAnthropicMessageContent::ToolUse {
-                    id: &tool_call.id,
-                    name: &tool_call.name,
-                    input,
-                })
+                Ok(Some(FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::ToolUse {
+                        id: &tool_call.id,
+                        name: &tool_call.name,
+                        input,
+                    },
+                )))
             }
-            ContentBlock::ToolResult(tool_result) => {
-                Ok(GCPVertexAnthropicMessageContent::ToolResult {
+            ContentBlock::ToolResult(tool_result) => Ok(Some(FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::ToolResult {
                     tool_use_id: &tool_result.id,
                     content: vec![GCPVertexAnthropicMessageContent::Text {
                         text: &tool_result.result,
                     }],
-                })
-            }
+                },
+            ))),
+            ContentBlock::Image(_) => Err(Error::new(ErrorDetails::UnsupportedContentBlockType {
+                content_block_type: "image".to_string(),
+                provider_type: PROVIDER_TYPE.to_string(),
+            })),
+            // We don't support thought blocks being passed in from a request.
+            // These are only possible to be passed in in the scenario where the
+            // output of a chat completion is used as an input to another model inference,
+            // i.e. a judge or something.
+            // We don't think the thoughts should be passed in in this case.
+            ContentBlock::Thought(_thought) => Ok(None),
+            ContentBlock::Unknown {
+                data,
+                model_provider_name: _,
+            } => Ok(Some(FlattenUnknown::Unknown(Cow::Borrowed(data)))),
         }
     }
 }
@@ -415,7 +455,7 @@ impl<'a> TryFrom<&'a ContentBlock> for GCPVertexAnthropicMessageContent<'a> {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct GCPVertexAnthropicMessage<'a> {
     role: GCPVertexAnthropicRole,
-    content: Vec<GCPVertexAnthropicMessageContent<'a>>,
+    content: Vec<FlattenUnknown<'a, GCPVertexAnthropicMessageContent<'a>>>,
 }
 
 impl<'a> TryFrom<&'a RequestMessage> for GCPVertexAnthropicMessage<'a> {
@@ -424,11 +464,14 @@ impl<'a> TryFrom<&'a RequestMessage> for GCPVertexAnthropicMessage<'a> {
     fn try_from(
         inference_message: &'a RequestMessage,
     ) -> Result<GCPVertexAnthropicMessage<'a>, Self::Error> {
-        let content: Vec<GCPVertexAnthropicMessageContent> = inference_message
+        let content: Vec<FlattenUnknown<GCPVertexAnthropicMessageContent>> = inference_message
             .content
             .iter()
             .map(|block| block.try_into())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<Option<FlattenUnknown<GCPVertexAnthropicMessageContent>>>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         Ok(GCPVertexAnthropicMessage {
             role: inference_message.role.into(),
@@ -561,9 +604,11 @@ fn prepare_messages(
                 0,
                 GCPVertexAnthropicMessage {
                     role: GCPVertexAnthropicRole::User,
-                    content: vec![GCPVertexAnthropicMessageContent::Text {
-                        text: "[listening]",
-                    }],
+                    content: vec![FlattenUnknown::Normal(
+                        GCPVertexAnthropicMessageContent::Text {
+                            text: "[listening]",
+                        },
+                    )],
                 },
             );
         }
@@ -575,9 +620,11 @@ fn prepare_messages(
         if last_message.role == GCPVertexAnthropicRole::Assistant {
             consolidated_messages.push(GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "[listening]",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "[listening]",
+                    },
+                )],
             });
         }
     }
@@ -588,9 +635,11 @@ fn prefill_json_message(messages: &mut Vec<GCPVertexAnthropicMessage>) {
     // Add a JSON-prefill message for Anthropic's JSON mode
     messages.push(GCPVertexAnthropicMessage {
         role: GCPVertexAnthropicRole::Assistant,
-        content: vec![GCPVertexAnthropicMessageContent::Text {
-            text: "Here is the JSON requested:\n{",
-        }],
+        content: vec![FlattenUnknown::Normal(
+            GCPVertexAnthropicMessageContent::Text {
+                text: "Here is the JSON requested:\n{",
+            },
+        )],
     });
 }
 
@@ -618,13 +667,13 @@ pub enum GCPVertexAnthropicContentBlock {
     },
 }
 
-impl TryFrom<GCPVertexAnthropicContentBlock> for ContentBlock {
+impl TryFrom<GCPVertexAnthropicContentBlock> for ContentBlockOutput {
     type Error = Error;
     fn try_from(block: GCPVertexAnthropicContentBlock) -> Result<Self, Self::Error> {
         match block {
             GCPVertexAnthropicContentBlock::Text { text } => Ok(text.into()),
             GCPVertexAnthropicContentBlock::ToolUse { id, name, input } => {
-                Ok(ContentBlock::ToolCall(ToolCall {
+                Ok(ContentBlockOutput::ToolCall(ToolCall {
                     id,
                     name,
                     arguments: serde_json::to_string(&input).map_err(|e| {
@@ -672,7 +721,7 @@ struct GCPVertexAnthropicResponseWithMetadata<'a> {
     response: GCPVertexAnthropicResponse,
     raw_response: String,
     latency: Latency,
-    request: GCPVertexAnthropicRequestBody<'a>,
+    request: serde_json::Value,
     function_type: &'a FunctionType,
     json_mode: &'a ModelInferenceRequestJsonMode,
     generic_request: &'a ModelInferenceRequest<'a>,
@@ -691,7 +740,7 @@ impl<'a> TryFrom<GCPVertexAnthropicResponseWithMetadata<'a>> for ProviderInferen
             generic_request,
         } = value;
 
-        let content: Vec<ContentBlock> = response
+        let content: Vec<ContentBlockOutput> = response
             .content
             .into_iter()
             .map(|block| block.try_into())
@@ -935,7 +984,7 @@ fn anthropic_to_tensorzero_stream_message(
                 Ok(None)
             }
         }
-        GCPVertexAnthropicStreamMessage::MessageStop | GCPVertexAnthropicStreamMessage::Ping {} => {
+        GCPVertexAnthropicStreamMessage::MessageStop | GCPVertexAnthropicStreamMessage::Ping => {
             Ok(None)
         }
     }
@@ -958,6 +1007,7 @@ fn parse_usage_info(usage_info: &Value) -> GCPVertexAnthropic {
 
 #[cfg(test)]
 mod tests {
+    use crate::inference::types::FlattenUnknown;
     use std::borrow::Cow;
 
     use super::*;
@@ -1037,10 +1087,14 @@ mod tests {
     fn test_try_from_content_block() {
         let text_content_block = "test".to_string().into();
         let anthropic_content_block =
-            GCPVertexAnthropicMessageContent::try_from(&text_content_block).unwrap();
+            Option::<FlattenUnknown<GCPVertexAnthropicMessageContent>>::try_from(
+                &text_content_block,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(
             anthropic_content_block,
-            GCPVertexAnthropicMessageContent::Text { text: "test" }
+            FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text { text: "test" })
         );
 
         let tool_call_content_block = ContentBlock::ToolCall(ToolCall {
@@ -1049,14 +1103,18 @@ mod tests {
             arguments: serde_json::to_string(&json!({"type": "string"})).unwrap(),
         });
         let anthropic_content_block =
-            GCPVertexAnthropicMessageContent::try_from(&tool_call_content_block).unwrap();
+            Option::<FlattenUnknown<GCPVertexAnthropicMessageContent>>::try_from(
+                &tool_call_content_block,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(
             anthropic_content_block,
-            GCPVertexAnthropicMessageContent::ToolUse {
+            FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::ToolUse {
                 id: "test_id",
                 name: "test_name",
                 input: json!({"type": "string"})
-            }
+            })
         );
     }
 
@@ -1073,7 +1131,9 @@ mod tests {
             anthropic_message,
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "test" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "test" }
+                )],
             }
         );
 
@@ -1088,9 +1148,11 @@ mod tests {
             anthropic_message,
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "test_assistant",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "test_assistant",
+                    }
+                )],
             }
         );
 
@@ -1109,12 +1171,14 @@ mod tests {
             anthropic_message,
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::ToolResult {
-                    tool_use_id: "test_tool_call_id",
-                    content: vec![GCPVertexAnthropicMessageContent::Text {
-                        text: "test_tool_response"
-                    }],
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::ToolResult {
+                        tool_use_id: "test_tool_call_id",
+                        content: vec![GCPVertexAnthropicMessageContent::Text {
+                            text: "test_tool_response"
+                        }],
+                    }
+                )],
             }
         );
     }
@@ -1123,9 +1187,11 @@ mod tests {
     fn test_initialize_anthropic_request_body() {
         let listening_message = GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
-            content: vec![GCPVertexAnthropicMessageContent::Text {
-                text: "[listening]",
-            }],
+            content: vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text {
+                    text: "[listening]",
+                },
+            )],
         };
         // Test Case 1: Empty message list
         let inference_request = ModelInferenceRequest {
@@ -1143,6 +1209,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = GCPVertexAnthropicRequestBody::new(&inference_request);
         let details = anthropic_request_body.unwrap_err().get_owned_details();
@@ -1179,6 +1246,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = GCPVertexAnthropicRequestBody::new(&inference_request);
         assert!(anthropic_request_body.is_ok());
@@ -1232,6 +1300,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::On,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let anthropic_request_body = GCPVertexAnthropicRequestBody::new(&inference_request);
         assert!(anthropic_request_body.is_ok());
@@ -1243,8 +1312,12 @@ mod tests {
                     GCPVertexAnthropicMessage {
                         role: GCPVertexAnthropicRole::User,
                         content: vec![
-                            GCPVertexAnthropicMessageContent::Text { text: "test_user" },
-                            GCPVertexAnthropicMessageContent::Text { text: "test_user2" }
+                            FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
+                                text: "test_user"
+                            }),
+                            FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
+                                text: "test_user2"
+                            })
                         ],
                     },
                     GCPVertexAnthropicMessage::try_from(&messages[2]).unwrap(),
@@ -1295,6 +1368,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::On,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
 
         let anthropic_request_body = GCPVertexAnthropicRequestBody::new(&inference_request);
@@ -1329,29 +1403,39 @@ mod tests {
     fn test_consolidate_messages() {
         let listening_message = GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
-            content: vec![GCPVertexAnthropicMessageContent::Text {
-                text: "[listening]",
-            }],
+            content: vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text {
+                    text: "[listening]",
+                },
+            )],
         };
         // Test case 1: No consolidation needed
         let messages = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hello" },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hi" },
+                )],
             },
         ];
         let expected = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hello" },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hi" },
+                )],
             },
             listening_message.clone(),
         ];
@@ -1361,32 +1445,42 @@ mod tests {
         let messages = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hello" },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "How are you?",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "How are you?",
+                    },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hi" },
+                )],
             },
         ];
         let expected = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
                 content: vec![
-                    GCPVertexAnthropicMessageContent::Text { text: "Hello" },
-                    GCPVertexAnthropicMessageContent::Text {
+                    FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
+                        text: "Hello",
+                    }),
+                    FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
                         text: "How are you?",
-                    },
+                    }),
                 ],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hi" },
+                )],
             },
             listening_message.clone(),
         ];
@@ -1396,42 +1490,52 @@ mod tests {
         let messages = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hello" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hello" },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "How are you?",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "How are you?",
+                    },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hi" }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text { text: "Hi" },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "I am here to help.",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "I am here to help.",
+                    },
+                )],
             },
         ];
         let expected = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
                 content: vec![
-                    GCPVertexAnthropicMessageContent::Text { text: "Hello" },
-                    GCPVertexAnthropicMessageContent::Text {
+                    FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
+                        text: "Hello",
+                    }),
+                    FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
                         text: "How are you?",
-                    },
+                    }),
                 ],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::Assistant,
                 content: vec![
-                    GCPVertexAnthropicMessageContent::Text { text: "Hi" },
-                    GCPVertexAnthropicMessageContent::Text {
+                    FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text { text: "Hi" }),
+                    FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
                         text: "I am here to help.",
-                    },
+                    }),
                 ],
             },
             listening_message.clone(),
@@ -1446,11 +1550,15 @@ mod tests {
         // Test case 5: Single message
         let messages = vec![GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
-            content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hello" }],
+            content: vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text { text: "Hello" },
+            )],
         }];
         let expected = vec![GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
-            content: vec![GCPVertexAnthropicMessageContent::Text { text: "Hello" }],
+            content: vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text { text: "Hello" },
+            )],
         }];
         assert_eq!(prepare_messages(messages.clone()).unwrap(), expected);
 
@@ -1458,38 +1566,42 @@ mod tests {
         let messages = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::ToolResult {
-                    tool_use_id: "tool1",
-                    content: vec![GCPVertexAnthropicMessageContent::Text {
-                        text: "Tool call 1",
-                    }],
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::ToolResult {
+                        tool_use_id: "tool1",
+                        content: vec![GCPVertexAnthropicMessageContent::Text {
+                            text: "Tool call 1",
+                        }],
+                    },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::ToolResult {
-                    tool_use_id: "tool2",
-                    content: vec![GCPVertexAnthropicMessageContent::Text {
-                        text: "Tool call 2",
-                    }],
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::ToolResult {
+                        tool_use_id: "tool2",
+                        content: vec![GCPVertexAnthropicMessageContent::Text {
+                            text: "Tool call 2",
+                        }],
+                    },
+                )],
             },
         ];
         let expected = vec![GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
             content: vec![
-                GCPVertexAnthropicMessageContent::ToolResult {
+                FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::ToolResult {
                     tool_use_id: "tool1",
                     content: vec![GCPVertexAnthropicMessageContent::Text {
                         text: "Tool call 1",
                     }],
-                },
-                GCPVertexAnthropicMessageContent::ToolResult {
+                }),
+                FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::ToolResult {
                     tool_use_id: "tool2",
                     content: vec![GCPVertexAnthropicMessageContent::Text {
                         text: "Tool call 2",
                     }],
-                },
+                }),
             ],
         }];
         assert_eq!(prepare_messages(messages.clone()).unwrap(), expected);
@@ -1498,41 +1610,47 @@ mod tests {
         let messages = vec![
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "User message 1",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "User message 1",
+                    },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::ToolResult {
-                    tool_use_id: "tool1",
-                    content: vec![GCPVertexAnthropicMessageContent::Text {
-                        text: "Tool call 1",
-                    }],
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::ToolResult {
+                        tool_use_id: "tool1",
+                        content: vec![GCPVertexAnthropicMessageContent::Text {
+                            text: "Tool call 1",
+                        }],
+                    },
+                )],
             },
             GCPVertexAnthropicMessage {
                 role: GCPVertexAnthropicRole::User,
-                content: vec![GCPVertexAnthropicMessageContent::Text {
-                    text: "User message 2",
-                }],
+                content: vec![FlattenUnknown::Normal(
+                    GCPVertexAnthropicMessageContent::Text {
+                        text: "User message 2",
+                    },
+                )],
             },
         ];
         let expected = vec![GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
             content: vec![
-                GCPVertexAnthropicMessageContent::Text {
+                FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
                     text: "User message 1",
-                },
-                GCPVertexAnthropicMessageContent::ToolResult {
+                }),
+                FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::ToolResult {
                     tool_use_id: "tool1",
                     content: vec![GCPVertexAnthropicMessageContent::Text {
                         text: "Tool call 1",
                     }],
-                },
-                GCPVertexAnthropicMessageContent::Text {
+                }),
+                FlattenUnknown::Normal(GCPVertexAnthropicMessageContent::Text {
                     text: "User message 2",
-                },
+                }),
             ],
         }];
         assert_eq!(prepare_messages(messages.clone()).unwrap(), expected);
@@ -1662,6 +1780,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let request_body = GCPVertexAnthropicRequestBody {
             anthropic_version: "1.0",
@@ -1680,7 +1799,7 @@ mod tests {
             response: anthropic_response_body.clone(),
             raw_response: raw_response.clone(),
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             function_type: &FunctionType::Chat,
             json_mode: &ModelInferenceRequestJsonMode::Off,
             generic_request: &generic_request,
@@ -1741,6 +1860,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let request_body = GCPVertexAnthropicRequestBody {
             anthropic_version: "1.0",
@@ -1758,7 +1878,7 @@ mod tests {
             response: anthropic_response_body.clone(),
             raw_response: raw_response.clone(),
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             function_type: &FunctionType::Chat,
             json_mode: &ModelInferenceRequestJsonMode::Off,
             generic_request: &generic_request,
@@ -1768,7 +1888,7 @@ mod tests {
         assert!(inference_response.output.len() == 1);
         assert_eq!(
             inference_response.output[0],
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 id: "tool_call_1".to_string(),
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location":"New York"}"#.to_string(),
@@ -1829,6 +1949,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            extra_body: None,
         };
         let request_body = GCPVertexAnthropicRequestBody {
             anthropic_version: "1.0",
@@ -1846,7 +1967,7 @@ mod tests {
             response: anthropic_response_body.clone(),
             raw_response: raw_response.clone(),
             latency: latency.clone(),
-            request: request_body,
+            request: serde_json::to_value(&request_body).unwrap(),
             function_type: &FunctionType::Chat,
             json_mode: &ModelInferenceRequestJsonMode::Off,
             generic_request: &generic_request,
@@ -1859,7 +1980,7 @@ mod tests {
         assert!(inference_response.output.len() == 2);
         assert_eq!(
             inference_response.output[1],
-            ContentBlock::ToolCall(ToolCall {
+            ContentBlockOutput::ToolCall(ToolCall {
                 id: "tool_call_2".to_string(),
                 name: "get_temperature".to_string(),
                 arguments: r#"{"location":"London"}"#.to_string(),
@@ -2194,9 +2315,11 @@ mod tests {
     fn test_prefill_json_message() {
         let input_messages = vec![GCPVertexAnthropicMessage {
             role: GCPVertexAnthropicRole::User,
-            content: vec![GCPVertexAnthropicMessageContent::Text {
-                text: "Generate some JSON",
-            }],
+            content: vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text {
+                    text: "Generate some JSON",
+                },
+            )],
         }];
 
         let mut result = input_messages.clone();
@@ -2207,17 +2330,21 @@ mod tests {
         assert_eq!(result[0].role, GCPVertexAnthropicRole::User);
         assert_eq!(
             result[0].content,
-            vec![GCPVertexAnthropicMessageContent::Text {
-                text: "Generate some JSON",
-            }]
+            vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text {
+                    text: "Generate some JSON",
+                }
+            )]
         );
 
         assert_eq!(result[1].role, GCPVertexAnthropicRole::Assistant);
         assert_eq!(
             result[1].content,
-            vec![GCPVertexAnthropicMessageContent::Text {
-                text: "Here is the JSON requested:\n{",
-            }]
+            vec![FlattenUnknown::Normal(
+                GCPVertexAnthropicMessageContent::Text {
+                    text: "Here is the JSON requested:\n{",
+                }
+            )]
         );
     }
 }

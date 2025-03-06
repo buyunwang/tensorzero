@@ -1,5 +1,6 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::instrument;
@@ -9,8 +10,8 @@ use crate::embeddings::EmbeddingModelTable;
 use crate::endpoints::inference::InferenceParams;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::types::{
-    ChatInferenceResult, ContentBlock, InferenceResult, Input, InputMessageContent,
-    JsonInferenceResult, ModelInferenceResponseWithMetadata, Role, Usage,
+    ChatInferenceResult, ContentBlockOutput, InferenceResult, Input, InputMessageContent,
+    JsonInferenceResult, ModelInferenceResponseWithMetadata, Role, TextKind, Usage,
 };
 use crate::jsonschema_util::{JSONSchemaFromPath, JsonSchemaRef};
 use crate::minijinja_util::TemplateConfig;
@@ -164,7 +165,7 @@ impl FunctionConfig {
     pub async fn prepare_response<'a, 'request>(
         &self,
         inference_id: Uuid,
-        content_blocks: Vec<ContentBlock>,
+        content_blocks: Vec<ContentBlockOutput>,
         usage: Usage,
         model_inference_results: Vec<ModelInferenceResponseWithMetadata>,
         inference_config: &'request InferenceConfig<'a, 'request>,
@@ -187,11 +188,11 @@ impl FunctionConfig {
                 // We assume here that the last content block that's text or a tool call is the JSON object.
                 // (this is because we could have used an implicit tool call and there is no other reason for a tool call in a JSON function).
                 let raw = content_blocks
-                    .into_iter()
+                    .iter()
                     .rev()
                     .find_map(|content_block| match content_block {
-                        ContentBlock::Text(text) => Some(text.text),
-                        ContentBlock::ToolCall(tool_call) => Some(tool_call.arguments),
+                        ContentBlockOutput::Text(text) => Some(&text.text),
+                        ContentBlockOutput::ToolCall(tool_call) => Some(&tool_call.arguments),
                         _ => None,
                     })
                     .ok_or_else(|| {
@@ -200,14 +201,14 @@ impl FunctionConfig {
                                 .to_string(),
                         })
                     })?;
-                let parsed_output = serde_json::from_str::<Value>(&raw)
+                let parsed_output = serde_json::from_str::<Value>(raw)
                     .map_err(|e| {
                         Error::new(ErrorDetails::OutputParsing {
                             message: format!(
                                 "Failed to parse output from JSON function response {}",
                                 e
                             ),
-                            raw_output: raw.clone(),
+                            raw_output: raw.to_string(),
                         })
                     })
                     .ok();
@@ -226,7 +227,7 @@ impl FunctionConfig {
                 };
                 Ok(InferenceResult::Json(JsonInferenceResult::new(
                     inference_id,
-                    raw,
+                    raw.to_string(),
                     parsed_output,
                     usage,
                     model_inference_results,
@@ -323,11 +324,11 @@ fn validate_all_text_input(
     }?;
     for (index, message) in input.messages.iter().enumerate() {
         // Only for Text blocks, not RawText blocks since we don't validate those
-        let mut content: Option<&Value> = None;
+        let mut content: Option<Cow<'_, Value>> = None;
         let mut text_seen = false;
         for block in message.content.iter() {
             match block {
-                InputMessageContent::Text { value } => {
+                InputMessageContent::Text(kind) => {
                     // Throw an error if we have multiple text blocks in a message
                     if text_seen {
                         return Err(Error::new(ErrorDetails::InvalidMessage {
@@ -336,7 +337,13 @@ fn validate_all_text_input(
                             ),
                         }));
                     }
-                    content = Some(value);
+                    content = Some(match kind {
+                        TextKind::Arguments { arguments } => {
+                            Cow::Owned(Value::Object(arguments.clone()))
+                        }
+                        TextKind::Text { text } => Cow::Owned(Value::String(text.clone())),
+                        TextKind::LegacyValue { value } => Cow::Borrowed(value),
+                    });
                     text_seen = true;
                 }
                 InputMessageContent::RawText { .. } => {
@@ -356,12 +363,12 @@ fn validate_all_text_input(
         if let Some(content) = content {
             match &message.role {
                 Role::Assistant => validate_single_message(
-                    content,
+                    &content,
                     assistant_schema,
                     Some((index, &message.role)),
                 )?,
                 Role::User => {
-                    validate_single_message(content, user_schema, Some((index, &message.role)))?
+                    validate_single_message(&content, user_schema, Some((index, &message.role)))?
                 }
             }
         }
@@ -568,7 +575,12 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
         let input = Input {
@@ -711,7 +723,9 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![json!({ "name": "user name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                })],
             },
             InputMessage {
                 role: Role::Assistant,
@@ -772,7 +786,12 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
         let input = Input {
@@ -835,11 +854,18 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![json!({ "name": "user name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
 
@@ -946,7 +972,9 @@ mod tests {
             InputMessage {
                 role: Role::User,
                 content: vec![
-                    json!({ "name": "user name" }).into(),
+                    InputMessageContent::Text(TextKind::Arguments {
+                        arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                    }),
                     InputMessageContent::RawText {
                         value: "raw text".to_string(),
                     },
@@ -954,7 +982,12 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
 
@@ -1014,11 +1047,18 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![json!({ "name": "user name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
 
@@ -1144,7 +1184,9 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![json!({ "name": "user name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                })],
             },
             InputMessage {
                 role: Role::Assistant,
@@ -1208,7 +1250,12 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
         let input = Input {
@@ -1266,11 +1313,18 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![json!({ "name": "user name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![json!({ "name": "assistant name" }).into()],
+                content: vec![InputMessageContent::Text(TextKind::Arguments {
+                    arguments: json!({ "name": "assistant name" })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                })],
             },
         ];
 
@@ -1609,7 +1663,7 @@ mod tests {
             name: "tool_call_name".to_string(),
             arguments: "tool_call_arguments".to_string(),
         };
-        let content_blocks = vec![ContentBlock::ToolCall(tool_call)];
+        let content_blocks = vec![ContentBlockOutput::ToolCall(tool_call)];
         let usage = Usage {
             input_tokens: 10,
             output_tokens: 10,
@@ -1660,7 +1714,7 @@ mod tests {
             name: "tool_call_name".to_string(),
             arguments: r#"{"name": "Jerry", "age": 30}"#.to_string(),
         };
-        let content_blocks = vec![ContentBlock::ToolCall(tool_call)];
+        let content_blocks = vec![ContentBlockOutput::ToolCall(tool_call)];
         let usage = Usage {
             input_tokens: 10,
             output_tokens: 10,
@@ -1867,7 +1921,7 @@ mod tests {
             name: "tool_call_name".to_string(),
             arguments: "tool_call_arguments".to_string(),
         };
-        let content_blocks = vec![ContentBlock::ToolCall(tool_call)];
+        let content_blocks = vec![ContentBlockOutput::ToolCall(tool_call)];
         let usage = Usage {
             input_tokens: 10,
             output_tokens: 10,
@@ -1918,7 +1972,7 @@ mod tests {
             name: "tool_call_name".to_string(),
             arguments: r#"{"answer": "42"}"#.to_string(),
         };
-        let content_blocks = vec![ContentBlock::ToolCall(tool_call)];
+        let content_blocks = vec![ContentBlockOutput::ToolCall(tool_call)];
         let usage = Usage {
             input_tokens: 10,
             output_tokens: 10,
